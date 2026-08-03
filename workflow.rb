@@ -6,215 +6,292 @@ module ChatAnalyst
   extend Workflow
   self.name = 'ChatAnalyst'
 
-  # A small reader over persisted chats and Scout jobs. Chat itself provides
-  # lineage IDs and metadata traces; this class only discovers the files to
-  # inspect and keeps enough structure for analyst reports.
-  class Session
-    attr_reader :root, :chats, :jobs, :edges, :warnings
-
-    def initialize(input)
-      @root = resolve_chat(input)
-      @chats, @jobs, @edges, @warnings = {}, {}, [], []
-      discover_chat(@root)
-    end
-
-    def trace(list = @chats.values)
-      Chat.trace_chats(list)
-    end
-
-    def token_entries(list = @chats.values)
-      trace(list).select do |entry|
-        meta = entry[:meta]
-        !meta[:job] && %w[pt ct tt].any? { |name| meta.include?(name) }
-      end
-    end
-
-    def token_totals(list = @chats.values)
-      token_entries(list).each_with_object({ prompt: 0, completion: 0, total: 0 }) do |entry, totals|
-        meta = entry[:meta]
-        totals[:prompt] += meta[:pt].to_i
-        totals[:completion] += meta[:ct].to_i
-        totals[:total] += meta[:tt].to_i
-      end
-    end
-
-    private
-
-    def resolve_chat(input)
-      candidates = [input, "#{input}.chat", File.expand_path(input), File.expand_path("#{input}.chat")]
-      begin
-        candidates << Scout.chats[input].find
-        candidates << Scout.chats[input].find_with_extension(:chat).find
-      rescue
-      end
-      candidates.compact.find { |path| File.file?(path.to_s) } ||
-        raise(ParameterException, "Chat not found: #{input}")
-    end
-
-    def discover_chat(path)
-      path = File.expand_path(path.to_s)
-      return if @chats.include?(path)
-      chat = Chat.load(path)
-      @chats[path] = chat
-
-      %w[import continue last].each do |role|
-        chat.role_messages(role).each do |message|
-          imported = Chat.find_file(message[:content].to_s.strip, path)
-          next unless imported && File.file?(imported.to_s)
-          imported = File.expand_path(imported.to_s)
-          @edges << { from: imported, to: path, type: :import }
-          discover_chat(imported)
-        end
-      end
-
-      chat.jobs.each do |reference|
-        job = discover_job(reference)
-        @edges << { from: job.path.to_s, to: path, type: :result } if job
-      end
-    rescue => e
-      @warnings << "Could not read chat #{path}: #{e.message}"
-    end
-
-    def discover_job(reference)
-      job = Step === reference ? reference : Step.load(reference)
-      path = File.expand_path(job.path.to_s)
-      return @jobs[path] if @jobs.include?(path)
-      @jobs[path] = job
-
-      job.dependencies.each do |dependency|
-        child = discover_job(dependency)
-        @edges << { from: child.path.to_s, to: path, type: :dependency } if child
-      end
-
-      discover_chat(path) if job.done? && job.type.to_s == 'chat'
-      log = job.file('log')
-      if log.directory?
-        log.glob('**/*.chat').sort.each do |file|
-          file = File.expand_path(file.to_s)
-          @edges << { from: path, to: file, type: :log }
-          discover_chat(file)
-        end
-      end
-      job
-    rescue => e
-      @warnings << "Could not load job #{reference}: #{e.message}"
-      nil
-    end
-  end
-
   helper :short_path do |path|
     path = File.expand_path(path.to_s)
     home = File.expand_path('~')
     path.start_with?(home + '/') ? "~#{path[home.length..]}" : path
   end
 
-  helper :roles do |chat|
-    chat.each_with_object(Hash.new(0)) { |message, counts| counts[message[:role].to_s] += 1 }
+  helper :resolve_root do |input|
+    candidates = [input, "#{input}.chat", File.expand_path(input), File.expand_path("#{input}.chat")]
+    begin
+      candidates << Scout.chats[input].find
+      candidates << Scout.chats[input].find_with_extension(:chat).find
+    rescue
+    end
+    candidate = candidates.compact.find { |path| File.file?(path.to_s) }
+    raise ParameterException, "Chat or job not found: #{input}" unless candidate
+
+    path = File.expand_path(candidate.to_s)
+    (File.exist?(path + '.info') || File.directory?(path + '.files')) ? [:job, Step.load(path)] : [:chat, Path.setup(path)]
   end
 
-  helper :safe_json do |value|
-    JSON.parse(value.to_s)
+  # Collect the shared core traversal into plain task-local data. This is
+  # report state, not a Session/Graph domain object.
+  helper :provenance_records do |file|
+    @provenance_records ||= {}
+    @provenance_records[file] ||= begin
+      root_kind, root = resolve_root(file)
+      warnings = []
+      records = Chat.traverse_provenance(
+        root,
+        root_type: root_kind,
+        on_error: lambda do |error, kind, object, relation, reference|
+          warnings << {
+            kind: kind,
+            path: short_path(Chat.provenance_path(kind, object)),
+            relation: relation,
+            reference: reference.to_s,
+            error: error.message
+          }
+        end
+      ).to_a
+
+      chats = {}
+      jobs = {}
+      edges = []
+      records.each do |kind, object, parent_kind, parent, relation, first_visit|
+        path = Chat.provenance_path(kind, object)
+        if first_visit
+          kind == :chat ? chats[path] = Chat.load(path) : jobs[path] = object
+        end
+        next unless parent
+        edge = {
+          from_kind: parent_kind,
+          from: Chat.provenance_path(parent_kind, parent),
+          relation: relation,
+          to_kind: kind,
+          to: path
+        }
+        edges << edge unless edges.include?(edge)
+      end
+
+      {
+        root_kind: root_kind,
+        root: Chat.provenance_path(root_kind, root),
+        records: records,
+        chats: chats,
+        jobs: jobs,
+        edges: edges,
+        warnings: warnings
+      }
+    end
+  end
+
+  helper :roles do |chat|
+    chat.each_with_object(Hash.new(0)) do |message, counts|
+      counts[message[:role].to_s] += 1
+    end
+  end
+
+  helper :target_agent do |call|
+    name = call[:name].to_s
+    return name.sub(/^hand_off_to_/, '') if name.start_with?('hand_off_to_')
+    return nil unless name == 'ask'
+
+    arguments = call[:arguments]
+    arguments = JSON.parse(arguments) if String === arguments
+    return nil unless Hash === arguments
+    arguments['agent'] || arguments[:agent] || arguments['target'] || arguments[:target]
   rescue JSON::ParserError
     nil
   end
 
-  helper :tool_calls do |chat, path|
-    calls, outputs = {}, {}
-    chat.each_with_index do |message, index|
-      info = safe_json(message[:content])
-      next unless info.is_a?(Hash)
-      case message[:role].to_s
-      when 'function_call', 'mcp_call'
-        calls[info['id'] || info['call_id'] || "#{index}"] = { tool: info['name'] || info.dig('function', 'name'), index: index }
-      when 'function_call_output'
-        outputs[info['id'] || info['call_id']] = { index: index, content: info['content'] }
-      end
-    end
-    calls.map do |id, call|
-      output = outputs[id]
-      raw = safe_json(output && output[:content])
-      failed = raw.is_a?(Hash) && (raw['exception'] || raw['exit_status'].to_i != 0 && raw.key?('exit_status'))
-      call.merge(file: short_path(path), call_id: id, output_index: output && output[:index], success: output ? !failed : nil)
+  helper :chat_tool_calls do |chat, path|
+    Chat.tool_calls(chat, source: path).collect do |call|
+      status = Chat.tool_call_status(call)
+      {
+        tool: call[:name],
+        call_id: call[:call_id],
+        arguments: call[:arguments],
+        call_address: [short_path(path), call[:call_index]],
+        output_address: call[:output_index] && [short_path(path), call[:output_index]],
+        success: status[:success],
+        status_reason: status[:reason],
+        exception: status[:exception],
+        exit_status: status[:exit_status],
+        agent_interaction: call[:name].to_s == 'ask' || call[:name].to_s.start_with?('hand_off_to_'),
+        target_agent: target_agent(call)
+      }.reject { |_key, value| value.nil? }
     end
   end
 
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :role, :string, 'Optional role filter', nil, nofile: true
+  desc 'Compact message index across every chat discovered by core provenance traversal.'
   task :message_index => :json do |file, role|
-    session = Session.new(file)
-    session.chats.flat_map do |path, chat|
-      chat.message_index.each_with_index.filter_map do |info, index|
+    provenance = provenance_records(file)
+    provenance[:chats].flat_map do |path, chat|
+      chat.message_index(source: path).filter_map do |info|
         next if role && !role.empty? && info[:role].to_s != role
-        { id: "#{short_path(path)}##{index}", lineage_id: info[:id], previous: info[:prev], file: short_path(path),
-          index: index, role: info[:role], fingerprint: info[:fingerprint], meta: info[:meta] }
+        index = info[:address].last
+        {
+          address: [short_path(path), index],
+          id: "#{short_path(path)}##{index}",
+          lineage_id: info[:id],
+          previous_lineage_id: info[:prev],
+          role: info[:role],
+          fingerprint: info[:fingerprint],
+          meta: info[:meta]
+        }
       end
     end
   end
 
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
-  input :ids, :array, 'Message IDs from message_index', nil, required: true
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :ids, :array, 'Addresses or legacy IDs from message_index', nil, required: true
+  desc 'Retrieve full message content by structured address or legacy path#index ID.'
   task :message_content => :json do |file, ids|
-    wanted = ids.to_set
-    Session.new(file).chats.flat_map do |path, chat|
+    wanted = ids.collect do |id|
+      if Array === id
+        [id.first.to_s, id.last.to_i]
+      else
+        path, separator, index = id.to_s.rpartition('##')
+        separator.empty? ? [id.to_s, 0] : [path, index.to_i]
+      end
+    end
+
+    provenance_records(file)[:chats].flat_map do |path, chat|
       chat.each_with_index.filter_map do |message, index|
-        id = "#{short_path(path)}##{index}"
-        { id: id, file: short_path(path), index: index, role: message[:role].to_s, content: message[:content].to_s } if wanted.include?(id)
+        short = short_path(path)
+        next unless wanted.include?([short, index]) || wanted.include?([path, index])
+        {
+          address: [short, index],
+          id: "#{short}##{index}",
+          role: message[:role].to_s,
+          content: message[:content].to_s
+        }
       end
     end
   end
 
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  desc 'Structural chats, jobs, and typed provenance relations.'
   task :chat_overview => :json do |file|
-    session = Session.new(file)
-    chats = session.chats.map do |path, chat|
-      { path: short_path(path), messages: chat.length, roles: roles(chat), jobs: chat.jobs, tool_calls: tool_calls(chat, path).length }
+    provenance = provenance_records(file)
+    chats = provenance[:chats].collect do |path, chat|
+      {
+        path: short_path(path),
+        messages: chat.length,
+        roles: roles(chat),
+        direct_jobs: chat.jobs.collect(&:to_s),
+        tool_calls: Chat.tool_calls(chat).length
+      }
     end
-    jobs = session.jobs.map do |path, job|
-      { path: short_path(path), workflow: job.info[:workflow], task: job.info[:task_name], dependencies: job.dependencies.length,
-        logs: session.edges.count { |edge| edge[:type] == :log && edge[:from] == path } }
+    jobs = provenance[:jobs].collect do |path, job|
+      {
+        path: short_path(path),
+        workflow: job.info[:workflow],
+        task: job.info[:task_name],
+        status: job.info[:status],
+        dependencies: job.dependencies.length,
+        direct_logs: provenance[:edges].count do |edge|
+          edge[:from_kind] == :job && edge[:from] == path && edge[:relation] == :log
+        end
+      }
     end
-    { root: short_path(session.root), chats: chats, jobs: jobs,
-      edges: session.edges.map { |edge| edge.merge(from: short_path(edge[:from]), to: short_path(edge[:to])) },
-      totals: { chats: chats.length, jobs: jobs.length, messages: chats.sum { |chat| chat[:messages] }, tool_calls: chats.sum { |chat| chat[:tool_calls] } },
-      warnings: session.warnings }
+    edges = provenance[:edges].collect do |edge|
+      edge.merge(from: short_path(edge[:from]), to: short_path(edge[:to]))
+    end
+    {
+      root: { kind: provenance[:root_kind], path: short_path(provenance[:root]) },
+      chats: chats,
+      jobs: jobs,
+      edges: edges,
+      totals: {
+        chats: chats.length,
+        jobs: jobs.length,
+        messages: chats.sum { |chat| chat[:messages] },
+        tool_calls: chats.sum { |chat| chat[:tool_calls] }
+      },
+      warnings: provenance[:warnings]
+    }
   end
 
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  desc 'Paired tool calls with source addresses and separately interpreted status.'
   task :chat_tool_calls => :json do |file|
-    session = Session.new(file)
-    calls = session.chats.flat_map { |path, chat| tool_calls(chat, path) }
-    { total: calls.length, successes: calls.count { |call| call[:success] }, failures: calls.count { |call| call[:success] == false },
-      by_tool: calls.group_by { |call| call[:tool] || '(unknown)' }.transform_values(&:length), calls: calls }
-  end
-
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
-  task :chat_tokens => :json do |file|
-    session = Session.new(file)
-    per_file = session.chats.map do |path, chat|
-      totals = session.token_totals([chat])
-      { path: short_path(path), inferences: session.token_entries([chat]).length, **totals }
+    calls = provenance_records(file)[:chats].flat_map do |path, chat|
+      chat_tool_calls(chat, path)
     end
-    { per_file: per_file, aggregate: session.token_totals,
-      trace_records: session.trace.length,
-      note: 'Counts direct pt/ct/tt metadata only. meta job=... is a projection marker; its cost is found recursively in agent logs and dependencies. *_c and *_s are checkpoints and are not summed.' }
+
+    {
+      total: calls.length,
+      successes: calls.count { |call| call[:success] == true },
+      failures: calls.count { |call| call[:success] == false },
+      incomplete: calls.count { |call| call[:success].nil? },
+      by_tool: calls.group_by { |call| call[:tool] || '(unknown)' }.transform_values(&:length),
+      calls: calls
+    }
   end
 
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  desc 'Direct inference token usage, deduplicated by inference ID with lineage fallback for legacy chats.'
+  task :chat_tokens => :json do |file|
+    provenance = provenance_records(file)
+    per_file = provenance[:chats].collect do |path, chat|
+      entries = Chat.direct_entries([chat])
+      {
+        path: short_path(path),
+        inferences: entries.length,
+        deduplication: entries.group_by { |entry| entry[:deduplication] }.transform_values(&:length),
+        **Chat.token_totals([chat])
+      }
+    end
+    trace = Chat.trace_chat_sources(provenance[:chats])
+    direct = trace.select do |entry|
+      !entry[:meta][:job] && Chat::TOKEN_KEYS.any? { |name| entry[:meta].include?(name) }
+    end
+    totals = Chat::TOKEN_KEYS.each_with_object({}) { |name, hash| hash[name.to_sym] = 0 }
+    direct.each do |entry|
+      Chat::TOKEN_KEYS.each { |name| totals[name.to_sym] += entry[:meta][name].to_i }
+    end
+    {
+      per_file: per_file,
+      aggregate: totals,
+      direct_inferences: direct.length,
+      trace_records: trace.length,
+      deduplication: direct.group_by { |entry| entry[:deduplication] }.transform_values(&:length),
+      note: 'Direct inference IDs are authoritative. Legacy records fall back to conversational lineage. Job projections and cumulative/session snapshots are not summed.'
+    }
+  end
+
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  desc 'Semantic ask and hand-off interactions found in persisted tool calls.'
   task :chat_agents => :json do |file|
-    session = Session.new(file)
-    calls = session.chats.flat_map { |path, chat| tool_calls(chat, path) }
-    interactions = calls.select { |call| call[:tool].to_s == 'ask' || call[:tool].to_s.start_with?('hand_off_to_') }
-    { interactions: interactions, failed: interactions.count { |call| call[:success] == false } }
+    calls = provenance_records(file)[:chats].flat_map do |path, chat|
+      chat_tool_calls(chat, path)
+    end
+    interactions = calls.select { |call| call[:agent_interaction] }
+    interactions.each { |interaction| interaction[:log_link] = :inferred_by_convention }
+    {
+      interactions: interactions,
+      failed: interactions.count { |call| call[:success] == false },
+      note: 'Tool calls are authoritative; links from socialized calls to society log files remain convention-based unless an explicit durable link is recorded.'
+    }
   end
 
-  input :file, :string, 'Root chat file', nil, required: true, jobname: true, nofile: true
+  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  desc 'Combined provenance, token, tool-call, and agent-interaction snapshot.'
   task :chat_report => :json do |file|
-    session = Session.new(file)
-    calls = session.chats.flat_map { |path, chat| tool_calls(chat, path) }
-    { root: short_path(session.root), chats: session.chats.length, jobs: session.jobs.length,
-      tokens: session.token_totals, trace_records: session.trace.length,
-      tool_calls: calls.first(20), failures: calls.select { |call| call[:success] == false }, warnings: session.warnings }
+    provenance = provenance_records(file)
+    chats = provenance[:chats]
+    calls = chats.flat_map { |path, chat| chat_tool_calls(chat, path) }
+    interactions = calls.select { |call| call[:agent_interaction] }
+    {
+      root: { kind: provenance[:root_kind], path: short_path(provenance[:root]) },
+      chats: chats.length,
+      jobs: provenance[:jobs].length,
+      edges: provenance[:edges].length,
+      tokens: Chat.token_totals(chats.values),
+      trace_records: Chat.trace_chat_sources(chats).length,
+      tool_calls: calls.first(20),
+      failures: calls.select { |call| call[:success] == false },
+      agent_interactions: interactions,
+      warnings: provenance[:warnings]
+    }
   end
 
-  export_exec :message_index, :message_content, :chat_overview, :chat_tool_calls, :chat_tokens, :chat_agents, :chat_report
+  export_exec :message_index, :message_content, :chat_overview,
+              :chat_tool_calls, :chat_tokens, :chat_agents, :chat_report
 end

@@ -1,17 +1,19 @@
 Inspect Scout-AI sessions, their lineage segments, producer jobs, agent logs, tool calls, and direct token usage without replaying them.
 
-ChatAnalyst reads persisted chats with `Chat.load`, follows `import`, `continue`,
-and `last` references, and traverses every job referenced by `meta job=...`.
+ChatAnalyst uses the shared `Chat.traverse_provenance` primitive. It reads persisted chats with `Chat.load` and traverses every job referenced by `meta job=...`. The workflow keeps report state in ordinary Hashes and Arrays; it does not define a Session or graph wrapper.
 For each job it follows persisted dependencies, chat results, and all
 `.files/log/**/*.chat` files — including the regular `log/agent.chat` logs and
 the socialized chat projections under `log/chats/<AgentName>/<conversation>.chat`.
+
+Imported and continued chats are not part of provenance; their content is
+already inlined in the persisted chat file during `Chat.parse`.
 
 A meta message starts a response segment. The segment can contain several tool
 calls, tool outputs, and an assistant message. It ends at another meta, a new
 user/system turn, or the end of the chat. A meta with an empty segment is an
 orphan record for a removed response message.
 
-Direct `pt`, `ct`, and `tt` metadata records one inference. `meta job=...` marks
+Direct `pt`, `ct`, and `tt` metadata records one inference. New records carry an `inference_id`, which is used for exact deduplication; legacy records fall back to conversational lineage and are marked accordingly. `meta job=...` marks
 one response segment projected from an ask job and has no direct token cost.
 The job's logs and dependencies contain the actual inference metadata. Running
 `*_c` and `*_s` values are checkpoints and are not summed.
@@ -54,29 +56,29 @@ Typical programmatic use:
 
 For command-line inspection of the same model, use:
 
-    scout-ai llm info /path/to/session.chat
+    scout-ai llm prov /path/to/session.chat
 
 # Tasks
 
 ## message_index
 Return a compact index of every discovered message
 
-Each result includes a file/index ID for retrieval, the message lineage ID,
+Each result includes a structured `[file, index]` address for retrieval, a legacy string ID, the message lineage ID,
 its previous lineage ID, role, fingerprint, and parsed metadata when present.
 Use the optional `role` input to select one message role.
 
 ## message_content
 Retrieve full content for selected indexed messages
 
-Pass IDs returned by `message_index`. The task returns the persisted role and
+Pass structured addresses or legacy IDs returned by `message_index`. The task returns the persisted role and
 untruncated content without compiling or executing the chat.
 
 ## chat_overview
 Summarize discovered chats, jobs, and provenance relationships
 
 The result lists role and message counts, producer-job references, tool-call
-counts, Workflow dependencies, agent-log counts, and import, result,
-dependency, and log edges.
+counts, Workflow dependencies, agent-log counts, and result, dependency, and
+log edges.
 
 ## chat_tool_calls
 Analyze function calls and their outputs
@@ -89,7 +91,7 @@ recorded.
 ## chat_tokens
 Report direct token usage across the lineage trace
 
-The task counts each direct metadata segment once using `pt`, `ct`, and `tt`.
+The task counts each direct metadata segment once using `pt`, `ct`, and `tt`. It prefers persisted inference IDs and reports when legacy lineage fallback was required.
 It reports per-file values and an aggregate across all discovered chats. Job
 projection metadata and cumulative/session checkpoints are not counted as
 independent inference usage.
