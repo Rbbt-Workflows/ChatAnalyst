@@ -1,0 +1,23 @@
+
+ChatAnalyst=/$PWD filter="*" {
+ README.md
+ search_report.md
+ start_chat
+ tooling
+ workflow.rb
+ workflow.rb.orig
+ chats=chats{
+  update_prov
+  message_content
+ }
+ tmp=tmp {
+  DMSO.json
+  PD.json
+  PI.json
+  tmp-262100271.chat
+  tmp-262100271.meta
+  tmp-262100271.options
+  workflow.rb.bak2
+  workflow.rb.bak
+ }
+}

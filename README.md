@@ -13,10 +13,26 @@ calls, tool outputs, and an assistant message. It ends at another meta, a new
 user/system turn, or the end of the chat. A meta with an empty segment is an
 orphan record for a removed response message.
 
-Direct `pt`, `ct`, and `tt` metadata records one inference. New records carry an `inference_id`, which is used for exact deduplication; legacy records fall back to conversational lineage and are marked accordingly. `meta job=...` marks
-one response segment projected from an ask job and has no direct token cost.
-The job's logs and dependencies contain the actual inference metadata. Running
-`*_c` and `*_s` values are checkpoints and are not summed.
+Direct `pt`, `ct`, `cct`, `rt`, and `tt` metadata records one inference. New
+records carry an `inference_id`, which is used for exact deduplication; legacy
+records fall back to conversational lineage and are marked accordingly. `meta
+job=...` marks one response segment projected from an ask job and has no direct
+token cost. The job's logs and dependencies contain the actual inference
+metadata. Running `*_c` and `*_s` values are checkpoints and are not summed.
+
+## Token count categories
+
+These are typical token count categories. Not all are always available.
+
+- pt: prompt tokens
+- ct: completion tokens
+- tt: total tokens
+- cct: cache tokens (subset of prompt tokens)
+- cwt: cache write tokens
+- rt: reasoning tokens
+
+When discussing tokens always consider that cache tokens are much less expensive in
+general (about 10% of the normal cost).
 
 ## Socialized chat files
 
@@ -63,14 +79,14 @@ For command-line inspection of the same model, use:
 ## message_index
 Return a compact index of every discovered message
 
-Each result includes a structured `[file, index]` address for retrieval, a legacy string ID, the message lineage ID,
+Each result includes a flat string address (`"path#index"`) for retrieval, the message lineage ID,
 its previous lineage ID, role, fingerprint, and parsed metadata when present.
 Use the optional `role` input to select one message role.
 
 ## message_content
 Retrieve full content for selected indexed messages
 
-Pass structured addresses or legacy IDs returned by `message_index`. The task returns the persisted role and
+Pass flat string IDs (`"path#index"`) returned by `message_index` or `chat_tool_calls`. The task returns the persisted role and
 untruncated content without compiling or executing the chat.
 
 ## chat_overview
@@ -81,17 +97,20 @@ counts, Workflow dependencies, agent-log counts, and result, dependency, and
 log edges.
 
 ## chat_tool_calls
-Analyze function calls and their outputs
+Compact index of function calls with retrievable addresses
 
 The task pairs `function_call` or `mcp_call` messages with
-`function_call_output` messages by call ID. It reports tool names, output
-positions, and success or failure when an exception or non-zero exit status is
-recorded.
+`function_call_output` messages by call ID. Each entry reports the tool name,
+flat string `call_address` and `output_address` IDs (each `"path#index"`),
+and success or failure status. Full tool-call arguments and outputs are **not**
+included to keep the response compact. Use `message_content` with any
+`call_address` or `output_address` to retrieve the full original message
+content.
 
 ## chat_tokens
 Report direct token usage across the lineage trace
 
-The task counts each direct metadata segment once using `pt`, `ct`, and `tt`. It prefers persisted inference IDs and reports when legacy lineage fallback was required.
+The task counts each direct metadata segment once using `pt`, `ct`, `cct`, `rt` and `tt`. It prefers persisted inference IDs and reports when legacy lineage fallback was required.
 It reports per-file values and an aggregate across all discovered chats. Job
 projection metadata and cumulative/session checkpoints are not counted as
 independent inference usage.
@@ -100,7 +119,7 @@ independent inference usage.
 List agent-oriented tool interactions
 
 The task selects calls named `ask` or `hand_off_to_*` and reports their source
-file, call ID, output position, and success state.
+file, call address, output address, and success state. All addresses are flat strings of the form `"path#index"`.
 
 ## chat_report
 Return a compact combined session report

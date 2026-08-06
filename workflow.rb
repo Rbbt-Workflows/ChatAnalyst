@@ -97,19 +97,23 @@ module ChatAnalyst
     nil
   end
 
+  # Return compact tool-call entries: tool name and retrievable addresses for
+  # the call and output messages. Full content can be fetched via
+  # message_content using the addresses. Status and agent fields are retained
+  # because they are small and useful for filtering and reporting.
   helper :chat_tool_calls do |chat, path|
+    short = short_path(path)
     Chat.tool_calls(chat, source: path).collect do |call|
       status = Chat.tool_call_status(call)
       {
         tool: call[:name],
-        call_id: call[:call_id],
-        arguments: call[:arguments],
-        call_address: [short_path(path), call[:call_index]],
-        output_address: call[:output_index] && [short_path(path), call[:output_index]],
+        call_address: "#{short}##{call[:call_index]}",
+        output_address: call[:output_index] && "#{short}##{call[:output_index]}",
         success: status[:success],
+        error: status[:error],
+        start_timestamp: status[:start_timestamp],
+        timestamp: status[:timestamp],
         status_reason: status[:reason],
-        exception: status[:exception],
-        exit_status: status[:exit_status],
         agent_interaction: call[:name].to_s == 'ask' || call[:name].to_s.start_with?('hand_off_to_'),
         target_agent: target_agent(call)
       }.reject { |_key, value| value.nil? }
@@ -124,43 +128,46 @@ module ChatAnalyst
     provenance[:chats].flat_map do |path, chat|
       chat.message_index(source: path).filter_map do |info|
         next if role && !role.empty? && info[:role].to_s != role
-        index = info[:address].last
+        path_str = short_path(path); index = info[:address].last
+        meta = info[:meta]
+        if Hash === meta
+          truncated_meta = {}
+          meta.each do |k,v|
+            truncated_meta[k] = String === v ? Log.truncate_string(v.to_s) : v
+          end
+          meta = truncated_meta
+        end
         {
-          address: [short_path(path), index],
-          id: "#{short_path(path)}##{index}",
+          address: "#{path_str}##{index}",
+          id: "#{path_str}##{index}",
           lineage_id: info[:id],
           previous_lineage_id: info[:prev],
           role: info[:role],
           fingerprint: info[:fingerprint],
-          meta: info[:meta]
+          meta: meta
         }
       end
     end
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
-  input :ids, :array, 'Addresses or legacy IDs from message_index', nil, required: true
-  desc 'Retrieve full message content by structured address or legacy path#index ID.'
+  input :ids, :array, 'Flat string IDs ("path#index") from message_index or chat_tool_calls', nil, required: true
+  desc 'Retrieve full message content by flat string ID ("path#index").'
   task :message_content => :json do |file, ids|
     wanted = ids.collect do |id|
       if Array === id
-        [id.first.to_s, id.last.to_i]
+        "#{id.first}##{id.last}"
       else
-        path, separator, index = id.to_s.rpartition('##')
-        separator.empty? ? [id.to_s, 0] : [path, index.to_i]
+        id.to_s
       end
     end
 
     provenance_records(file)[:chats].flat_map do |path, chat|
+      short = short_path(path)
       chat.each_with_index.filter_map do |message, index|
-        short = short_path(path)
-        next unless wanted.include?([short, index]) || wanted.include?([path, index])
-        {
-          address: [short, index],
-          id: "#{short}##{index}",
-          role: message[:role].to_s,
-          content: message[:content].to_s
-        }
+        id = "#{short}##{index}"
+        next unless wanted.include?(id) || wanted.include?("#{path}##{index}")
+        message.merge(id: id)
       end
     end
   end
@@ -209,7 +216,7 @@ module ChatAnalyst
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
-  desc 'Paired tool calls with source addresses and separately interpreted status.'
+  desc 'Compact tool-call index with retrievable addresses. Use message_content with call_address or output_address to fetch full content.'
   task :chat_tool_calls => :json do |file|
     calls = provenance_records(file)[:chats].flat_map do |path, chat|
       chat_tool_calls(chat, path)
