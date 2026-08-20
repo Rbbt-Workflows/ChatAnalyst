@@ -1,4 +1,3 @@
-
 ChatAnalyst=/$PWD filter="*" {
  README.md
  search_report.md
@@ -7,6 +6,7 @@ ChatAnalyst=/$PWD filter="*" {
  workflow.rb
  workflow.rb.orig
  chats=chats{
+  pagination
   update_prov
   message_content
  }

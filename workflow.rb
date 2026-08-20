@@ -122,10 +122,12 @@ module ChatAnalyst
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :role, :string, 'Optional role filter', nil, nofile: true
+  input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
+  input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
   desc 'Compact message index across every chat discovered by core provenance traversal.'
-  task :message_index => :json do |file, role|
+  task :message_index => :json do |file, role, page, per_page|
     provenance = provenance_records(file)
-    provenance[:chats].flat_map do |path, chat|
+    messages = provenance[:chats].flat_map do |path, chat|
       chat.message_index(source: path).filter_map do |info|
         next if role && !role.empty? && info[:role].to_s != role
         path_str = short_path(path); index = info[:address].last
@@ -148,6 +150,30 @@ module ChatAnalyst
         }
       end
     end
+
+    next messages unless page
+
+    per_page ||= 50
+    page = page.to_i
+    per_page = per_page.to_i
+    per_page = 1 if per_page < 1
+    total = messages.length
+    total_pages = (total.to_f / per_page).ceil
+    total_pages = 1 if total_pages < 1
+    page = 1 if page < 1
+
+    offset = (page - 1) * per_page
+    paged = messages[offset, per_page] || []
+
+    {
+      messages: paged,
+      page: page,
+      per_page: per_page,
+      total: total,
+      total_pages: total_pages,
+      next_page: page < total_pages ? page + 1 : nil,
+      prev_page: page > 1 ? page - 1 : nil
+    }
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true

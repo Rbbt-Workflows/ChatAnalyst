@@ -74,6 +74,11 @@ For command-line inspection of the same model, use:
 
     scout-ai llm prov /path/to/session.chat
 
+In addition to this mechanisms, when an agent requests help from another agent
+using `ask` the corresponding `function_call_output` field may include a field
+called `agent_meta` containing all the meta fields involved in that inference.
+This allows token accounting from society interactions outside of chat_tasks.
+
 # Tasks
 
 ## message_index
@@ -82,6 +87,13 @@ Return a compact index of every discovered message
 Each result includes a flat string address (`"path#index"`) for retrieval, the message lineage ID,
 its previous lineage ID, role, fingerprint, and parsed metadata when present.
 Use the optional `role` input to select one message role.
+
+When the `page` input is set, the task returns a paginated result instead of a
+flat array. The response is an object containing a `messages` array for the
+requested page, along with `page`, `per_page`, `total`, `total_pages`,
+`next_page`, and `prev_page` metadata for navigating the result set. The
+`per_page` input controls page size and defaults to 50 when `page` is set.
+When `page` is not set, the task returns the full flat array as before.
 
 ## message_content
 Retrieve full content for selected indexed messages
