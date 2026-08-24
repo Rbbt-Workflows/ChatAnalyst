@@ -93,6 +93,13 @@ For command-line inspection of the same model, use:
 
     scout-ai llm prov /path/to/session.chat
 
+Note that these logs are done automatically when workflows `ask` tasks are used
+for inference when defined using the function  `chat_task` from the
+`AgentWorkflow` mixin, and can save societies recursively. If there is not
+surrounding `ask` `chat_task` these detailed logs will be lost, but agent
+receipts (`agent_meta`) will still be available, containing some auditable
+information.
+
 ## Delegated agent receipts (`agent_meta`)
 
 When an agent requests help from another agent using `ask` (or a
