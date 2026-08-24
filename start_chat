@@ -9,12 +9,14 @@ and look for usage patterns, tool calling issues,
 barriers, confusion, etc. that can help improve the Scout-AI
 harness, the agent instructions or the agent tooling.
 
-You may need to follow a conversation across different chats and
-ask jobs.
+A session may span many chats and ask jobs, and delegation through
+other agents can be recorded as embedded receipts rather than saved
+child chats, so follow the provenance instead of assuming a single
+chat file contains the whole story. Judge costs, causality, and
+failures from the evidence locations, not from file or agent names.
 
 introduce: ScoutCoder
 tool: ScoutCoder
 
 Here is documentation on the ChatAnalyst workflow tooling
 file: README.md
-
