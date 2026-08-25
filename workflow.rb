@@ -288,6 +288,63 @@ module ChatAnalyst
     event[:evidence].all? { |item| item[:origin] == :agent_meta }
   end
 
+  # Shared pagination envelope, following the message_index shape: setting
+  # page bounds only the main list of a report, never its totals, so any
+  # paginated response doubles as a bounded summary. Returns nil when page is
+  # nil so tasks keep their historical unpaginated shape.
+  helper :paginate_items do |items, page, per_page|
+    next nil unless page
+
+    per_page = (per_page || 50).to_i
+    per_page = 1 if per_page < 1
+    page = page.to_i
+    total = items.length
+    total_pages = (total.to_f / per_page).ceil
+    total_pages = 1 if total_pages < 1
+    page = 1 if page < 1
+
+    offset = (page - 1) * per_page
+    {
+      page: page,
+      per_page: per_page,
+      total: total,
+      total_pages: total_pages,
+      next_page: page < total_pages ? page + 1 : nil,
+      prev_page: page > 1 ? page - 1 : nil,
+      items: items[offset, per_page] || []
+    }
+  end
+
+  # Identity of one logical tool call: tool name, provider call id, and the
+  # exact arguments. Socialized projections, result chats, and log copies of
+  # one chat replay identical ids and arguments, so a repeated identity is a
+  # persisted copy of the same call, never two independent calls. Provider
+  # call ids are unique per conversation, which keeps distinct calls apart.
+  helper :tool_call_identity do |call|
+    Digest::MD5.hexdigest([call[:tool], call[:call_id], call[:arguments]].to_json)
+  end
+
+  # Mark repeated tool-call identities as copies of their first occurrence in
+  # traversal order. Returns [marked calls, unique count]; marked copies carry
+  # copy_of with the address of the first occurrence, retrievable through
+  # message_content. The first occurrence itself is never marked.
+  helper :mark_call_copies do |calls|
+    canonical = {}
+    unique = 0
+    marked = calls.collect do |call|
+      identity = tool_call_identity(call)
+      first = canonical[identity]
+      if first
+        call.merge(copy_of: first)
+      else
+        unique += 1
+        canonical[identity] = call[:call_address]
+        call
+      end
+    end
+    [marked, unique]
+  end
+
   helper :target_agent do |call|
     name = call[:name].to_s
     return name.sub(/^hand_off_to_/, '') if name.start_with?('hand_off_to_')
@@ -430,29 +487,9 @@ module ChatAnalyst
       end
     end
 
-    next messages unless page
-
-    per_page ||= 50
-    page = page.to_i
-    per_page = per_page.to_i
-    per_page = 1 if per_page < 1
-    total = messages.length
-    total_pages = (total.to_f / per_page).ceil
-    total_pages = 1 if total_pages < 1
-    page = 1 if page < 1
-
-    offset = (page - 1) * per_page
-    paged = messages[offset, per_page] || []
-
-    {
-      messages: paged,
-      page: page,
-      per_page: per_page,
-      total: total,
-      total_pages: total_pages,
-      next_page: page < total_pages ? page + 1 : nil,
-      prev_page: page > 1 ? page - 1 : nil
-    }
+    envelope = paginate_items(messages, page, per_page)
+    next envelope.merge(messages: envelope.delete(:items)) if envelope
+    messages
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
@@ -538,34 +575,47 @@ module ChatAnalyst
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
+  input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
+  input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
+  input :dedupe, :boolean, 'Mark socialized/log copies of the same logical call; summary counts stay raw', false, nofile: true
   desc 'Compact tool-call index with addresses and delegated receipt summaries.'
-  task :chat_tool_calls => :json do |file, follow|
+  task :chat_tool_calls => :json do |file, follow, page, per_page, dedupe|
     provenance = provenance_data(file, follow)
     calls = provenance[:chats].flat_map do |path, chat|
       chat_tool_calls(chat, path, events: provenance[:events])
     end
+    calls, unique_calls = dedupe ? mark_call_copies(calls) : [calls, nil]
 
-    {
+    result = {
       total: calls.length,
       successes: calls.count { |call| call[:success] == true },
       failures: calls.count { |call| call[:success] == false },
       incomplete: calls.count { |call| call[:success].nil? },
+      copies: calls.count { |call| call[:copy_of] },
       by_tool: calls.group_by { |call| call[:tool] || '(unknown)' }.transform_values(&:length),
       calls: calls
     }
+    result[:unique_calls] = unique_calls if unique_calls
+
+    envelope = paginate_items(calls, page, per_page)
+    next envelope.merge(calls: envelope.delete(:items), **result.except(:calls)) if envelope
+    result
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
+  input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
+  input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
   desc 'Deduplicated direct inference token usage with evidence locations and receipt coverage.'
-  task :chat_tokens => :json do |file, follow|
+  task :chat_tokens => :json do |file, follow, page, per_page|
     provenance = provenance_data(file, follow)
     events = provenance[:events]
     totals = scope_totals(events)
+    compact_events = events.collect { |event| compact_event(event) }
 
-    {
+    result = {
       **totals,
-      events: events.collect { |event| compact_event(event) },
+      events: compact_events,
       conflicts: events.select { |event| event[:conflict] }.collect do |event|
         {
           inference_id: event[:inference_id],
@@ -588,12 +638,18 @@ module ChatAnalyst
         'Conflicting events are counted once from canonical evidence; totals containing conflicts are best-effort, not authoritative.'
       ]
     }
+
+    envelope = paginate_items(compact_events, page, per_page)
+    next envelope.merge(events: envelope.delete(:items), **result.except(:events)) if envelope
+    result
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
+  input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
+  input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
   desc 'Agent interactions (ask and hand_off_to_*) with receipt evidence and agent_job links.'
-  task :chat_agents => :json do |file, follow|
+  task :chat_agents => :json do |file, follow, page, per_page|
     provenance = provenance_data(file, follow)
     events = provenance[:events]
     edges = provenance[:edges]
@@ -654,12 +710,16 @@ module ChatAnalyst
       end
     end
 
-    {
+    result = {
       interactions: interactions,
       failed: interactions.count { |interaction| interaction[:success] == false },
       warnings: provenance[:warnings],
       note: 'Agent associations come from agent_job provenance edges recorded in the delegated receipt, never from path or agent-name conventions.'
     }
+
+    envelope = paginate_items(interactions, page, per_page)
+    next envelope.merge(interactions: envelope.delete(:items), **result.except(:interactions)) if envelope
+    result
   end
 
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
@@ -804,7 +864,8 @@ module ChatAnalyst
       chat_tool_calls(chat, path, events: events)
     end
 
-    receipt_summaries = calls.select { |call| call[:agent_meta] }.first(3).collect do |call|
+    marked_calls, _unique = mark_call_copies(calls)
+    receipt_summaries = marked_calls.select { |call| call[:agent_meta] && !call[:copy_of] }.first(3).collect do |call|
       {
         source: call[:call_address].split('#').first,
         call_id: call[:call_id] || call[:call_address],
@@ -813,6 +874,8 @@ module ChatAnalyst
         **call[:agent_meta].slice(:receipt_meta_count, :direct_event_ids, :direct_token_total, :agent_job_references)
       }
     end
+
+    failures = calls.select { |call| call[:success] == false }
 
     {
       root: { kind: provenance[:root_kind], path: provenance[:root] },
@@ -829,7 +892,9 @@ module ChatAnalyst
         incomplete_evidence: events.count { |event| event[:incomplete_evidence] }
       },
       tool_calls: calls.length,
-      failures: calls.select { |call| call[:success] == false }.first(10),
+      unique_tool_calls: calls.length - marked_calls.count { |call| call[:copy_of] },
+      failed_tool_calls: failures.length,
+      failures: failures.first(10),
       receipt_summaries: receipt_summaries,
       warnings: provenance[:warnings]
     }

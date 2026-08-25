@@ -18,9 +18,13 @@ class TestCrossConsumerTokens < Test::Unit::TestCase
     line && line[/total=(\d+)/, 1]
   end
 
+# ScoutCoder: test-unit (bundled with Scout workflows) skips tests with
+# `omit "reason"`, not RSpec/minitest-style `skip` — an undefined `skip` raises
+# NoMethodError and turns the whole test into an error instead of an omission.
+
   def prov_evidence(path)
     scout_bin = ENV['SCOUT_AI_BIN'] || File.expand_path('~/git/scout-ai/bin/scout-ai')
-    skip "#{scout_bin} not available" unless File.executable?(scout_bin)
+    omit "#{scout_bin} not available" unless File.executable?(scout_bin)
     out, _err, _status = Open3.capture3({'SCOUT_LOG' => '0'},
                                         RbConfig.ruby, scout_bin,
                                         'llm', 'prov', '--evidence', path)

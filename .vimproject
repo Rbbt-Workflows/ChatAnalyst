@@ -1,23 +1,100 @@
 ChatAnalyst=/$PWD filter="*" {
  README.md
- search_report.md
  start_chat
- tooling
  workflow.rb
- workflow.rb.orig
  chats=chats{
-  pagination
-  update_prov
+  agent_meta_update
   message_content
+  pagination
+  tooling
+  traverse_prov
+  update_prov
+
+  improve_after_doc
  }
  tmp=tmp {
   DMSO.json
   PD.json
   PI.json
+  accounting_own.json
+  chained3.out
+  chatanalyst-implementation-notes.md
+  compare_default.rb
+  compare_default2.rb
+  default_new.json
+  default_new.json.norm
+  default_old.json
+  default_old.json.norm
+  demo.md
+  design.md
+  dump_report.rb
+  new_norm.json
+  norm_compare.py
+  norm_compare2.py
+  old_norm.json
+  patch2.py
+  patch3.py
+  patch4.py
+  patch_follow.py
+  patch_readme.py
+  patch_readme2.py
+  patch_readme3.py
+  patch_tests.py
+  probe10.rb
+  probe11.rb
+  probe12.rb
+  probe13.rb
+  probe14.rb
+  probe15.rb
+  probe16.rb
+  probe17.rb
+  probe18.rb
+  probe19.rb
+  probe20.rb
+  probe21.rb
+  probe22.rb
+  probe23.rb
+  probe24.rb
+  probe25.rb
+  probe26.rb
+  probe3.rb
+  probe4.rb
+  probe5.rb
+  probe6.rb
+  probe7.rb
+  probe8.rb
+  probe9.rb
+  probe_chained.rb
+  probe_chained2.rb
+  probe_chained3.rb
+  probe_chat_accounting.rb
+  probe_closures.rb
+  probe_reas.rb
+  probe_reasoning.rb
+  probe_relationships.rb
+  probe_traverse.rb
+  run_default_once.rb
+  run_task.rb
+  run_task2.rb
+  same_dir_compare.py
+  smoke_tasks.rb
   tmp-262100271.chat
   tmp-262100271.meta
   tmp-262100271.options
-  workflow.rb.bak2
+  tmp-362011719.chat
+  tmp-362011719.meta
+  tmp-362011719.options
+  tmp-36649133.chat
+  tmp-36649133.meta
+  tmp-36649133.options
+  tmp-39879753.chat
+  tmp-39879753.meta
+  tmp-39879753.options
+  tmp-972497704.chat
+  tmp-972497704.meta
+  tmp-972497704.options
+  workflow_old.rb
+  README.md.bak
   workflow.rb.bak
  }
 }

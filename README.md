@@ -136,6 +136,8 @@ index is too large for one response.
 
 Embedded `agent_meta` receipts are **not** messages of the parent chat and are
 therefore never listed here; use `meta_evidence` for those.
+The `page`/`per_page` inputs paginate the message list without touching any
+other field: totals and counts always cover the full session.
 
 ## message_content
 Retrieve full content for selected indexed messages
@@ -181,6 +183,15 @@ legacy receipt count, and any receipt warnings. Use `message_content` with the
 call or output address for the full arguments and output text; the summary
 never re-parses the output JSON.
 
+Set `page` (optionally `per_page`) to paginate the call list; totals,
+`by_tool`, and failure counts still cover every call. A session holds several
+persisted copies of the same logical call — socialized projections under
+`log/chats`, result chats, and job logs replay identical call ids and
+arguments — so with `dedupe: true` every later copy is marked with `copy_of`
+(the address of its first occurrence) and the result reports `copies` and
+`unique_calls` alongside the raw `total`, which keeps counting every evidence
+copy.
+
 ## chat_tokens
 Deduplicated direct inference token usage with evidence locations
 
@@ -200,6 +211,10 @@ canonical evidence, so a total containing conflicts is best-effort rather than
 authoritative; `conflicts` and `incomplete_evidence` list those cases and
 `warnings` collects discovery problems.
 
+Set `page` (optionally `per_page`) to page through the event list; every
+total (deduplicated, coverage scopes, receipt-only) still covers all events,
+so a paginated call is a bounded cost summary.
+
 ## chat_agents
 Agent interactions with receipt evidence and agent_job links
 
@@ -214,6 +229,9 @@ classification (`receipt_only`, `log_only`, `both`, `receipt_unresolved`, or
 Associations come exclusively from `agent_job` edge details recorded in the
 receipt, never from path or agent-name conventions. Use this task to answer
 "what did delegation cost and where did each delegated answer come from".
+
+Set `page` (optionally `per_page`) to page through the interactions; the
+`failed` count still covers all of them.
 
 ## meta_evidence
 Unified meta evidence across ordinary messages and receipts
