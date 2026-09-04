@@ -124,7 +124,11 @@ module ChatAnalyst
     raise ParameterException, "Chat or job not found: #{input}" unless candidate
 
     path = File.expand_path(candidate.to_s)
-    (File.exist?(path + '.info') || File.directory?(path + '.files')) ? [:job, Step.load(path)] : [:chat, Path.setup(path)]
+    # A persisted Step always has an .info sidecar. A .files directory alone is
+    # NOT evidence: saved agent chats carry one too. Only the .info test decides,
+    # and the chat branch then relies on scout-ai provenance to scan the sidecar
+    # for society conversations (relation :log).
+    File.exist?(path + '.info') ? [:job, Step.load(path)] : [:chat, Path.setup(path)]
   end
 
   # Normalize one provenance problem into a compact, serializable warning
@@ -154,6 +158,13 @@ module ChatAnalyst
       reference: (String === entry[:reference] || String === reference) ? (entry[:reference] || reference).to_s : nil,
       error: error || entry[:message] || entry[:error]
     }
+    # N1 rev3: an unresolved_job_reference without a String reference is a
+    # reference-less failure (e.g. a traversal-stage on_error callback for an
+    # agent_job edge whose reference Hash carries only structural facts).
+    # Mark it instead of letting the nil reference flow downstream.
+    if warning[:reason].to_s == 'unresolved_job_reference' && warning[:reference].nil?
+      warning[:malformed] = true
+    end
     warning[:identity] = entry[:identity] if entry[:identity]
     warning[:fields] = entry[:fields] if entry[:fields]
     warning[:values] = entry[:values] if entry[:values]
@@ -961,9 +972,24 @@ module ChatAnalyst
     # already-deduplicated event list, so root + delegated + unattributed
     # reconciles with deduplicated_total and nothing is double counted.
     edges = provenance[:edges]
-    root_chat_paths = Set[File.expand_path(provenance[:root].to_s)] +
-                      provenance[:jobs].select { |job| provenance[:root_kind] == :job }
-                                        .flat_map { |job| delegated_subtree_chats(edges, job) }
+    # N2 rev3: on a job root, root_chat_tokens must cover the job's own chats
+    # (agent chat through :log, result chat through :result), per the README.
+    # provenance[:jobs] is a Hash path => job; iterating it yields [key, value]
+    # pairs, so the previous select/flat_map never matched a job node and every
+    # event fell into unattributed_tokens.  Walk the root job's OWN chats only
+    # (:log/:result, not agent_job/dependency) so root_chat_tokens stays
+    # disjoint from delegated_tokens and the three-way split still reconciles.
+    root_chat_paths = Set[File.expand_path(provenance[:root].to_s)]
+    if provenance[:root_kind] == :job
+      root_job = provenance[:jobs].keys.find { |key| short_path(key) == provenance[:root].to_s }
+      root_job ||= provenance[:jobs].keys.first
+      if root_job
+        root_chat_paths += provenance[:edges].select do |edge|
+          edge[:from] == short_path(root_job) && %i[log result].include?(edge[:relation]) &&
+            edge[:to_kind] == :chat
+        end.collect { |edge| File.expand_path(edge[:to].to_s) }
+      end
+    end
     root_tokens, root_count = delegated_events(events, root_chat_paths)
     linked_jobs = edges.select { |edge| edge[:relation] == :agent_job }
                        .map { |edge| edge[:to] }.uniq
@@ -976,11 +1002,16 @@ module ChatAnalyst
     delegated_tokens, delegated_count = delegated_events(events, delegated_union)
     unattributed = sum_events(events.select { |event| !root_chat_paths.include?(canonical_event_source(event)) &&
                                                 !delegated_union.include?(canonical_event_source(event)) })
-    unresolved_jobs = provenance[:warnings].select { |warning| warning[:reason].to_s == 'unresolved_job_reference' }
-                                           .collect { |warning| warning[:reference] }.uniq
+    unresolved_warnings = provenance[:warnings].select { |warning| warning[:reason].to_s == 'unresolved_job_reference' }
+    # N1 rev3: only genuinely-reference-bearing failures belong in the list;
+    # reference-less malformed edges are counted, not serialized as nil.
+    unresolved_jobs = unresolved_warnings.collect { |warning| warning[:reference] }
+                                        .compact.uniq
+    malformed_edges = unresolved_warnings.count { |warning| warning[:reference].nil? }
 
     delegation = {
       linked_jobs: linked_jobs.length,
+      malformed_edges: malformed_edges,
       subtrees: subtree_rows,
       root_chat_tokens: root_tokens,
       root_chat_events: root_count,

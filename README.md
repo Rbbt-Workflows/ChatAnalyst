@@ -317,8 +317,11 @@ chats), the summed delegated tokens, `unattributed_tokens` (the remainder,
 e.g. import-closure evidence), and `unresolved_jobs` from provenance
 warnings that report an unresolved job reference. `deduplicated_total`
 already includes resolved delegated subtrees; per-node subtree values may
-overlap when several calls link the same job. Use it as the first answer to
-"what happened here", then drill into the dedicated tasks.
+overlap when several calls link the same job. The delegation block also
+carries `malformed_edges`, the count of reference-less unresolved-receipt
+warnings (malformed agent_job edges), which are kept out of
+`unresolved_jobs` so that list stays strings-only. Use it as the first
+answer to "what happened here", then drill into the dedicated tasks.
 
 ## provenance_relationships
 Chat-level import, continue, and last reference events and import closure
