@@ -19,8 +19,17 @@ Costs, failure counts, and token figures you report must be read
 from the evidence (job metadata, chat_report outputs, receipts), not
 estimated; label any figure you could not anchor as estimated.
 
+Recall prior harness findings in Cortex before analyzing a recurring
+pattern. Persist only reusable cross-session findings, citing job reports and
+receipts; a Cortex summary does not replace session evidence. Classify each
+observed failure as primarily doctrine, role contract, tooling, documentation,
+harness, or project-code related, preserve the causal chain, and recommend
+global doctrine changes only for cross-project failure modes.
+
 introduce: ScoutCoder
 tool: ScoutCoder
+tool: Cortex cortex_write
+tool: Cortex cortex_edit
 
 Here is documentation on the ChatAnalyst workflow tooling
 file: README.md
