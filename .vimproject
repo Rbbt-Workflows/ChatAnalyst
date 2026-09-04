@@ -11,6 +11,8 @@ ChatAnalyst=/$PWD filter="*" {
   update_prov
 
   improve_after_doc
+
+  provenance_update
  }
  tmp=tmp {
   DMSO.json
