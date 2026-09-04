@@ -107,6 +107,25 @@ module ChatAnalystFixtures
     [parent, worker, dep]
   end
 
+  # 7) cortex_continue delegation: the only delegation mechanism used in
+  # AGS sessions.  The parent chat carries a real cortex_continue call whose
+  # function_call_output embeds a job= receipt; the child job saves its log
+  # chat with its own token meta, so the whole cost is recoverable through
+  # the agent_job edge (child evidence :log_only, no receipt token fields).
+  def fixture_cortex_continue(dir)
+    worker_log = "user: continue work\n" +
+                 "meta: pt=100 ct=50 tt=150 inference_id=w1\n" +
+                 "assistant: done\n"
+    worker = make_job(dir, 'Cortex/continue/Default_1', logs: {'agent.chat' => worker_log})
+    call = 'function_call: ' + %({\"name\":\"cortex_continue\",\"arguments\":{\"agent\":\"Worker\",\"conversation\":\"c1\"},\"id\":\"x1\"})
+    output = 'function_call_output: ' + {name: 'cortex_continue', content: 'child answer', id: 'x1', agent_meta: [meta_receipt("job=#{worker}")]}.to_json
+    parent = write_chat(dir, 'parent.chat',
+                        "user: go\n" + call + "\n" + output + "\n" +
+                        "meta: pt=4 ct=2 tt=6 inference_id=p1\n" +
+                        "assistant: done\n")
+    [parent, worker]
+  end
+
   # 4) Identity conflict: two receipt copies of g1 disagree on tt and on the
   # provider response id.
   def fixture_conflict(dir)

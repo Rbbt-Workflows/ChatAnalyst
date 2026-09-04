@@ -14,6 +14,15 @@ class TestCrossConsumerTokens < Test::Unit::TestCase
   # The first line of `--evidence` output is the root chat total, which is the
   # deduplicated aggregate (same number the tree mode shows for the root).
   def parse_root_total(output)
+    # ScoutCoder: with the Option-B rendering now in scout-ai, --evidence prints
+    # per-event 'total=N' lines in the direct-events section BEFORE any aggregate;
+    # the authoritative root figure is the 'root deduplicated_total=N' footer, so
+    # it must be read first (the old first-'chat'-line heuristic now returns the
+    # first per-event total instead of the session total).
+    # (the marker may carry ANSI colour codes between 'root' and the value,
+    # so match the unique deduplicated_total= token directly)
+    footer = output[/deduplicated_total=(\d+)/, 1]
+    return footer if footer
     line = output.lines.find { |l| l.include?('chat') && l =~ /total=/ }
     line && line[/total=(\d+)/, 1]
   end

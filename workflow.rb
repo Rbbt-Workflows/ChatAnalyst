@@ -9,6 +9,17 @@ module ChatAnalyst
 
   TOKEN_KEYS = Chat::TOKEN_KEYS.map(&:to_sym).freeze
 
+  # Delegation tools whose calls are agent interactions.  Any other tool
+  # whose call carries agent_meta receipt records is still classified as a
+  # delegation by the generic fallback in chat_tool_calls, so other suites'
+  # delegation tools are never silently missed.
+  DELEGATION_TOOLS = %w[ask cortex_continue cortex_brief].freeze
+
+  # Relations followed when attributing delegated spend to a linked job: its
+  # logs, results, further delegations, and nested jobs, but never
+  # :dependency, which would attribute upstream jobs to the delegation.
+  DELEGATION_SUBTREE_RELATIONS = %i[log result agent_job job].freeze
+
   helper :short_path do |path|
     path = File.expand_path(path.to_s)
     home = File.expand_path('~')
@@ -288,6 +299,50 @@ module ChatAnalyst
     event[:evidence].all? { |item| item[:origin] == :agent_meta }
   end
 
+  # Canonical evidence source path of an event (first evidence record's
+  # source, or its meta address path), as an expanded filesystem path so it
+  # can be compared with subtree chat sets.
+  helper :canonical_event_source do |event|
+    canonical = event[:evidence].first
+    return nil unless canonical
+    source = canonical[:source] || canonical[:meta_address]&.first
+    source && File.expand_path(source.to_s)
+  end
+
+  # Collect the chat files reachable from a job through the delegation
+  # subtree relations (logs, results, nested delegations, nested jobs), never
+  # through :dependency: upstream jobs are not this delegation's cost.  The
+  # edges are the normalized provenance edges; job nodes are matched by their
+  # short_path form.  Returns expanded chat paths as a Set.
+  helper :delegated_subtree_chats do |edges, job_path|
+    target = short_path(job_path.to_s)
+    subtree_chats = Set.new
+    visited = Set.new
+    queue = [target]
+    until queue.empty?
+      node = queue.shift
+      next unless visited.add?(node)
+      edges.each do |edge|
+        next unless DELEGATION_SUBTREE_RELATIONS.include?(edge[:relation])
+        next unless edge[:from] == node
+        if edge[:to_kind] == :chat
+          subtree_chats << File.expand_path(edge[:to].to_s)
+        elsif edge[:to_kind] == :job
+          queue << edge[:to]
+        end
+      end
+    end
+    subtree_chats
+  end
+
+  # Delegated spend attributed to a set of subtree chats: the
+  # already-deduplicated events whose canonical evidence lives in those
+  # chats.  Never re-sums raw evidence; returns [token totals, event count].
+  helper :delegated_events do |events, subtree_chats|
+    matched = events.select { |event| subtree_chats.include?(canonical_event_source(event)) }
+    [sum_events(matched), matched.length]
+  end
+
   # Shared pagination envelope, following the message_index shape: setting
   # page bounds only the main list of a report, never its totals, so any
   # paginated response doubles as a bounded summary. Returns nil when page is
@@ -348,12 +403,14 @@ module ChatAnalyst
   helper :target_agent do |call|
     name = call[:name].to_s
     return name.sub(/^hand_off_to_/, '') if name.start_with?('hand_off_to_')
-    return nil unless name == 'ask'
+    return nil unless DELEGATION_TOOLS.include?(name)
 
     arguments = call[:arguments]
     arguments = JSON.parse(arguments) if String === arguments
     return nil unless Hash === arguments
-    arguments['agent'] || arguments[:agent] || arguments['target'] || arguments[:target]
+    # Raw value on purpose: 'Worker/brief-name' stays intact for consumers.
+    arguments['agent'] || arguments[:agent] || arguments['agent_name'] || arguments[:agent_name] ||
+      arguments['target'] || arguments[:target]
   rescue JSON::ParserError
     nil
   end
@@ -371,6 +428,14 @@ module ChatAnalyst
   # receipt summary taken from the core evidence APIs. The output JSON is
   # never re-parsed here: receipts come from Chat.agent_meta_evidence and
   # event attribution from the provenance token events.
+  # Generic delegation fallback: a call whose function_call_output carries
+  # agent_meta receipt records is a delegation even when the tool is not in
+  # DELEGATION_TOOLS, so other suites' delegation tools are never missed.
+  helper :agent_meta_receipt_call? do |chat, path, call|
+    receipts = Chat.agent_meta_evidence(chat, source: path)
+    receipts.any? { |record| record[:call_id] == call[:call_id] }
+  end
+
   helper :chat_tool_calls do |chat, path, events: []|
     short = short_path(path)
     receipt_warnings = []
@@ -390,7 +455,9 @@ module ChatAnalyst
         start_timestamp: status[:start_timestamp],
         timestamp: status[:timestamp],
         status_reason: status[:reason],
-        agent_interaction: call[:name].to_s == 'ask' || call[:name].to_s.start_with?('hand_off_to_'),
+        agent_interaction: DELEGATION_TOOLS.include?(call[:name].to_s) ||
+                            call[:name].to_s.start_with?('hand_off_to_') ||
+                            agent_meta_receipt_call?(chat, path, call),
         target_agent: target_agent(call),
         conversation: target_conversation(call)
       }.reject { |_key, value| value.nil? }
@@ -648,7 +715,7 @@ module ChatAnalyst
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
   input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
-  desc 'Agent interactions (ask and hand_off_to_*) with receipt evidence and agent_job links.'
+  desc 'Agent interactions (ask, cortex_continue, cortex_brief, hand_off_to_*, and any call with agent_meta receipts) with receipt evidence, agent_job links, and delegated token totals.'
   task :chat_agents => :json do |file, follow, page, per_page|
     provenance = provenance_data(file, follow)
     events = provenance[:events]
@@ -670,6 +737,16 @@ module ChatAnalyst
         end
         linked_jobs = agent_job_edges.collect { |edge| edge[:to] }.uniq
         linked_logs = linked_jobs.any? { |job| (log_edges_by_job[job] || []).any? }
+
+        # Delegated spend: the union of every linked job's subtree chats
+        # (logs, results, nested delegations; never dependencies) holding the
+        # canonical evidence of an event.  Sums already-deduplicated events
+        # only, so a chat shared by several delegations is counted once here
+        # even though each linked job reports its own subtree.
+        subtree_chats = linked_jobs.each_with_object(Set.new) do |job, union|
+          union.merge(delegated_subtree_chats(edges, job))
+        end
+        delegated_tokens, delegated_count = delegated_events(events, subtree_chats)
 
         matched_events = events_for_call(events, path, call[:call_id])
         receipt_direct = matched_events.any? { |event| event[:evidence].any? { |item| item[:origin] == :agent_meta } }
@@ -705,7 +782,9 @@ module ChatAnalyst
           agent_job_edges: agent_job_edges.collect { |edge| edge[:detail] },
           linked_job: linked_jobs.first,
           child_evidence: child_evidence,
-          log_link: linked_jobs.empty? ? :none : :agent_job_edge
+          log_link: linked_jobs.empty? ? :none : :agent_job_edge,
+          delegated_token_total: delegated_tokens,
+          delegated_event_count: delegated_count
         }.reject { |_key, value| value.nil? }
       end
     end
@@ -714,7 +793,7 @@ module ChatAnalyst
       interactions: interactions,
       failed: interactions.count { |interaction| interaction[:success] == false },
       warnings: provenance[:warnings],
-      note: 'Agent associations come from agent_job provenance edges recorded in the delegated receipt, never from path or agent-name conventions.'
+      note: 'Agent associations come from agent_job provenance edges recorded in the delegated receipt, never from path or agent-name conventions. delegated_token_total sums the already-deduplicated events whose canonical evidence lies in the linked jobs\' subtrees; it may overlap across interactions that link the same job.'
     }
 
     envelope = paginate_items(interactions, page, per_page)
@@ -877,6 +956,40 @@ module ChatAnalyst
 
     failures = calls.select { |call| call[:success] == false }
 
+    # Delegation rollup: spend located in the root chat's own file versus
+    # spend located in agent_job subtrees.  Both come from the one
+    # already-deduplicated event list, so root + delegated + unattributed
+    # reconciles with deduplicated_total and nothing is double counted.
+    edges = provenance[:edges]
+    root_chat_paths = Set[File.expand_path(provenance[:root].to_s)] +
+                      provenance[:jobs].select { |job| provenance[:root_kind] == :job }
+                                        .flat_map { |job| delegated_subtree_chats(edges, job) }
+    root_tokens, root_count = delegated_events(events, root_chat_paths)
+    linked_jobs = edges.select { |edge| edge[:relation] == :agent_job }
+                       .map { |edge| edge[:to] }.uniq
+    subtree_rows = linked_jobs.collect do |job|
+      chats = delegated_subtree_chats(edges, job)
+      tokens, count = delegated_events(events, chats)
+      { job: job, tokens: tokens, events: count, chats: chats.collect { |c| short_path(c) } }
+    end
+    delegated_union = linked_jobs.each_with_object(Set.new) { |job, union| union.merge(delegated_subtree_chats(edges, job)) }
+    delegated_tokens, delegated_count = delegated_events(events, delegated_union)
+    unattributed = sum_events(events.select { |event| !root_chat_paths.include?(canonical_event_source(event)) &&
+                                                !delegated_union.include?(canonical_event_source(event)) })
+    unresolved_jobs = provenance[:warnings].select { |warning| warning[:reason].to_s == 'unresolved_job_reference' }
+                                           .collect { |warning| warning[:reference] }.uniq
+
+    delegation = {
+      linked_jobs: linked_jobs.length,
+      subtrees: subtree_rows,
+      root_chat_tokens: root_tokens,
+      root_chat_events: root_count,
+      delegated_tokens: delegated_tokens,
+      delegated_events: delegated_count,
+      unattributed_tokens: unattributed,
+      unresolved_jobs: unresolved_jobs
+    }
+
     {
       root: { kind: provenance[:root_kind], path: provenance[:root] },
       chats: provenance[:chats].length,
@@ -896,7 +1009,14 @@ module ChatAnalyst
       failed_tool_calls: failures.length,
       failures: failures.first(10),
       receipt_summaries: receipt_summaries,
-      warnings: provenance[:warnings]
+      delegation: delegation,
+      warnings: provenance[:warnings],
+      notes: [
+        'deduplicated_total already includes the tokens of resolved delegated subtrees (agent_job children); delegated_tokens is a view of that total, not an addition to it.',
+        'Per-subtree values may overlap when one job is linked by several interactions: they are coverage views of the same deduplicated event set, never a partition.',
+        'unattributed_tokens is spend whose canonical evidence lies in no root or delegated subtree chat, e.g. events imported from other chats.',
+        'unresolved_jobs are referenced delegation jobs whose cost is missing from this accounting because the job could not be resolved.'
+      ]
     }
   end
 
@@ -938,7 +1058,7 @@ module ChatAnalyst
   input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   input :scope, :string, "Accounting scope: 'own' (default) accounts each chat in the import closure separately from its own file; 'closure' merges the whole closure into one root entry", 'own', nofile: true
-  desc 'Separate accounting for a chat and every chat it imports, without merging imported costs into the root.'
+  desc 'Separate accounting for a chat and every chat it imports, without merging imported costs into the root. Each own-scope entry also splits its tokens into direct_tokens (canonical evidence in the chat file itself) and delegated_tokens (canonical evidence in agent_job subtrees); the tokens field keeps its full subtree-inclusive meaning when follow includes agent_job.'
   task :chat_accounting => :json do |file, follow, scope|
     root_kind, root = resolve_root(file)
     raise ParameterException, 'chat_accounting requires a chat file root; pass the chat path directly' unless root_kind == :chat
@@ -954,6 +1074,20 @@ module ChatAnalyst
       events = own[:events]
       totals = scope_totals(events)
       calls = own[:chats].flat_map { |chat_path, chat_obj| chat_tool_calls(chat_obj, chat_path, events: events) }
+
+      # Direct/delegated split for this chat: direct spend has its canonical
+      # evidence in the chat file itself; delegated spend lives in the
+      # agent_job subtrees reachable from it.  Both are views of the entry's
+      # own deduplicated event list.
+      own_edges = own[:edges]
+      own_direct_chats = Set[File.expand_path(chat)]
+      own_linked_jobs = own_edges.select { |edge| edge[:relation] == :agent_job }
+                                 .map { |edge| edge[:to] }.uniq
+      own_subtrees = own_linked_jobs.each_with_object(Set.new) do |job, union|
+        union.merge(delegated_subtree_chats(own_edges, job))
+      end
+      direct_tokens, direct_count = delegated_events(events, own_direct_chats)
+      delegated_tokens, delegated_count = delegated_events(events, own_subtrees)
 
       imports = chat_relationship_references(chat).select { |relationship| relationship[:type] == :import }
       {
@@ -972,6 +1106,11 @@ module ChatAnalyst
         incomplete_evidence: events.count { |event| event[:incomplete_evidence] },
         tool_calls: calls.length,
         direct_jobs: own[:chats].length,
+        direct_tokens: direct_tokens,
+        direct_events: direct_count,
+        delegated_tokens: delegated_tokens,
+        delegated_events: delegated_count,
+        delegated_subtrees: own_linked_jobs.collect { |job| short_path(job) },
         warnings: own[:warnings].length
       }
     end
@@ -1005,7 +1144,7 @@ module ChatAnalyst
       scope: scope.to_sym,
       closure: closure.collect { |chat| short_path(chat) },
       entries: entries,
-      note: 'own scope: each chat is accounted from its own file with its own job/log provenance; imported chats never contribute to another entry. closure scope merges all events with inference_id deduplication.'
+      note: 'own scope: each chat is accounted from its own file with its own job/log provenance; imported chats never contribute to another entry. closure scope merges all events with inference_id deduplication. tokens includes delegated subtrees when follow includes agent_job; direct_tokens + delegated_tokens may overlap it only via shared chats, otherwise they partition it.'
     }
   end
 

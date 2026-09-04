@@ -2,8 +2,14 @@ Inspect Scout-AI sessions, their lineage segments, producer jobs, agent logs, to
 
 ChatAnalyst uses the shared `Chat.traverse_provenance` primitive. It reads persisted chats with `Chat.load` and traverses every job referenced by `meta job=...`. The workflow keeps report state in ordinary Hashes and Arrays; it does not define a Session or graph wrapper.
 For each job it follows persisted dependencies, chat results, and all
-`.files/log/**/*.chat` files — including the regular `log/agent.chat` logs and
-the socialized chat projections under `log/chats/<AgentName>/<conversation>.chat`.
+the chats saved in the job's `.files` sidecar, under two coexisting layouts:
+the current layout writes the agent's full chat at
+`<job>.files/<name>.chat` (`agent.chat` by default, otherwise named after the
+agent, e.g. `worker.chat`) and every nested conversation under
+`<job>.files/<name>.society/**/*.chat`; the legacy
+`<job>.files/log/**/*.chat` layout (including the old `log/agent.chat` logs
+and the `log/chats/...` projections) is written by older scout-ai, read for
+compatibility, and never migrated.
 
 Imported and continued chats are not part of core provenance; their content is
 already inlined in the persisted chat file during `Chat.parse`. To account for
@@ -53,11 +59,24 @@ These are typical token count categories. Not all are always available.
 When discussing tokens always consider that cache tokens are much less expensive in
 general (about 10% of the normal cost).
 
-## Socialized chat files
+## Society chats and legacy socialized projections
 
 When a Manager or supervisor agent dispatches work to a specialist agent through
 the `ask` tool with a named `conversation`, the specialist interaction is
-persisted as a socialized chat file at:
+persisted as a full chat of the society tree:
+
+```text
+<caller_job>.files/<name>.society/<AgentName>/<conversation>/agent.chat
+```
+
+The `<name>` component names the caller's own log (`agent.society` by
+default, mirroring the agent's own log name, e.g. `worker.society`). These
+files are the agent's full chats, including the tool calls and the direct
+inference metadata of every model call, so they are counted directly by
+`chat_tokens` and appear like any other chat of the session.
+
+Older scout-ai wrote a different artifact for the same mechanism: a
+**legacy socialized projection** (read for compatibility, never migrated) at
 
 ```text
 <caller_job>.files/log/chats/<AgentName>/<conversation_name>.chat
@@ -70,19 +89,22 @@ carry **zero direct inference tokens**. The actual model calls and tool activity
 are found by following the `meta: job=...` reference to the specialist's ask-job
 and reading its `agent.chat` log and dependencies.
 
-When inspecting a session that uses socialized agents:
+When inspecting a session that uses socialized agents, the legacy projection
+files behave as follows (current society files behave like any other chat,
+with their own inferences and tokens):
 
-- Socialized chat files will appear in `chat_overview` with `tool_calls: N`
+- Legacy projection files will appear in `chat_overview` with `tool_calls: N`
   reflecting only the calls visible in the projected segment, not the full set
   of calls in the underlying job.
-- Socialized chat files will show `inferences: 0` and zero tokens in
+- Legacy projection files will show `inferences: 0` and zero tokens in
   `chat_tokens` because they only carry a projection marker.
-- The `chat_overview` edges connect socialized chats to their producer jobs via
+- The `chat_overview` edges connect legacy projections to their producer jobs via
   `result` edges and to the caller job via `log` edges.
 - To find the real token usage and full tool-call count, follow the
   `meta: job=...` reference to the specialist's ask-job and inspect its
-  `agent.chat` log and any nested dependencies (such as gather or pre-processing
-  jobs).
+  `agent.chat` log (or the equivalent top-level log in the layout that job
+  was saved with) and any nested dependencies (such as gather or
+  pre-processing jobs).
 
 Typical programmatic use:
 
@@ -93,9 +115,20 @@ For command-line inspection of the same model, use:
 
     scout-ai llm prov /path/to/session.chat
 
-Note that these logs are done automatically when workflows `ask` tasks are used
-for inference when defined using the function  `chat_task` from the
-`AgentWorkflow` mixin, and can save societies recursively. If there is not
+Since the scout-ai provenance revamp (commit 3a37b24), the default tree
+numbers every node with `evidence=`, a subtree-deduplicated closure of the
+direct inference events reachable from that node; these values overlap between
+siblings and ancestors and are never a per-part cost. Job nodes additionally
+carry `delta=`, the direct totals of the job's persisted chat-typed result
+(the accounting delta; deltas sum to the root total on continuation chains).
+Both modes end with a root footer `deduplicated_total=<tt> (<N> events) ...`,
+which is the one authoritative cost figure; with `--component` the per-node
+numbers are relabeled `direct=` (per-component direct tokens) while the
+footer stays authoritative.
+
+Note that these logs are written automatically when workflows `ask` tasks are
+used for inference and are defined using the function `chat_task` from the
+`AgentWorkflow` mixin, and that they save societies recursively. Without a
 surrounding `ask` `chat_task` these detailed logs will be lost, but agent
 receipts (`agent_meta`) will still be available, containing some auditable
 information.
@@ -186,7 +219,7 @@ never re-parses the output JSON.
 Set `page` (optionally `per_page`) to paginate the call list; totals,
 `by_tool`, and failure counts still cover every call. A session holds several
 persisted copies of the same logical call — socialized projections under
-`log/chats`, result chats, and job logs replay identical call ids and
+`log/chats` (legacy), result chats, and job logs replay identical call ids and
 arguments — so with `dedupe: true` every later copy is marked with `copy_of`
 (the address of its first occurrence) and the result reports `copies` and
 `unique_calls` alongside the raw `total`, which keeps counting every evidence
@@ -218,13 +251,19 @@ so a paginated call is a bounded cost summary.
 ## chat_agents
 Agent interactions with receipt evidence and agent_job links
 
-The task selects `ask` and `hand_off_to_*` calls and reports, per
-interaction: source chat, call ID, target agent and conversation when present
-in the arguments, success state, the receipt summary (event IDs,
-receipt-only IDs, receipt token total, referenced jobs), the matching
-`agent_job` edge details, the linked producer Step, and the child evidence
-classification (`receipt_only`, `log_only`, `both`, `receipt_unresolved`, or
-`none`).
+The task selects every delegation call — `ask`, `cortex_continue`,
+`cortex_brief`, any `hand_off_to_*` tool — and, as a generic fallback, any
+call whose `function_call_output` carries `agent_meta` receipt records, so
+delegation tools from other suites are never silently missed. It reports,
+per interaction: source chat, call ID, target agent (in the raw
+`Agent/brief` form when present) and conversation when present in the
+arguments, success state, the receipt summary (event IDs, receipt-only IDs,
+receipt token total, referenced jobs), the matching `agent_job` edge
+details, the linked producer Step, the child evidence classification
+(`receipt_only`, `log_only`, `both`, `receipt_unresolved`, or `none`), and
+the delegated cost rollup: `delegated_token_total` and
+`delegated_event_count`, the deduplicated tokens of the events whose
+canonical evidence lies in the union of the linked jobs' subtree chats.
 
 Associations come exclusively from `agent_job` edge details recorded in the
 receipt, never from path or agent-name conventions. Use this task to answer
@@ -270,8 +309,16 @@ Return a concise combined session snapshot
 The one-screen summary for a session: root, chat/job/edge counts,
 `agent_job` edge count, the deduplicated and receipt-only token totals with
 event counts, multi-evidence and conflict/incomplete counts, tool-call totals,
-the first failures, up to three receipt summaries, and warnings. Use it as the
-first answer to "what happened here", then drill into the dedicated tasks.
+the first failures, up to three receipt summaries, warnings, and a delegation
+block. The delegation block reports, per linked job, the tokens and event
+count of its subtree chats (deduplicated, uniq by job), plus the root chat
+tokens (canonical events in the root chat file and the root job's own
+chats), the summed delegated tokens, `unattributed_tokens` (the remainder,
+e.g. import-closure evidence), and `unresolved_jobs` from provenance
+warnings that report an unresolved job reference. `deduplicated_total`
+already includes resolved delegated subtrees; per-node subtree values may
+overlap when several calls link the same job. Use it as the first answer to
+"what happened here", then drill into the dedicated tasks.
 
 ## provenance_relationships
 Chat-level import, continue, and last reference events and import closure
@@ -300,7 +347,12 @@ conflicts, incomplete evidence, tool calls, direct jobs, warnings, and the
 list of imports (plus `unresolved_imports` when a reference cannot be
 resolved). With `scope: closure` it merges all closure events with
 `inference_id` deduplication into a single root entry, reporting token events
-per chat.
+per chat. Each entry also splits its cost: `direct_tokens` are the canonical
+events located in that chat file itself, while `delegated_tokens` (with the
+`delegated_subtrees` job list) are the canonical events in `agent_job`
+subtrees reachable from that chat. The existing `tokens` field keeps its old
+meaning, which includes delegated subtrees whenever the `follow` option
+resolves `agent_job` edges.
 
 This is the task for the progressive-import use case: run it on the latest
 chat of a chain and get the accounting of every previous chat separately. For

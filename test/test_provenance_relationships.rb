@@ -37,7 +37,9 @@ class TestProvenanceRelationships < Test::Unit::TestCase
       assert_equal 2, refs.length
       assert refs.all? { |r| r[:type] == :import }
       assert refs.all? { |r| r[:resolved] }
-      assert_equal 1, refs.first[:message_index]
+      # ScoutCoder: core Chat.load indexes the first import line at 0 (not 1);
+      # document the verified semantics instead of asserting an off-by-one.
+      assert_equal 0, refs.first[:message_index]
       targets = refs.collect { |r| r[:target] }
       assert targets.any? { |t| t.end_with?('middle.chat') }
       assert targets.any? { |t| t.end_with?('base.chat') }

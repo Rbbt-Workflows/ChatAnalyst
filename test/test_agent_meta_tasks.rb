@@ -161,6 +161,57 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     end
   end
 
+  # cortex_continue (the AGS delegation mechanism) must be reported as an
+  # interaction with the child's log-chat cost attributed through the
+  # agent_job edge, even though the receipt carries no token fields.
+  def test_cortex_continue_interaction_and_delegated_tokens
+    Dir.mktmpdir do |dir|
+      parent, worker = fixture_cortex_continue(dir)
+      agents = ChatAnalyst.job(:chat_agents, {file: parent}).run
+      assert_equal 1, agents[:interactions].length
+      interaction = agents[:interactions].first
+      assert_equal 'cortex_continue', interaction[:tool]
+      assert_equal 'Worker', interaction[:target_agent]
+      assert_equal 'c1', interaction[:conversation]
+      assert_equal :log_only, interaction[:child_evidence]
+      assert_equal 1, interaction[:agent_job_edges].length
+      assert interaction[:agent_job_edges].first[:job].include?('Cortex/continue/Default_1')
+      assert_equal 150, interaction[:delegated_token_total][:tt]
+      assert_equal 1, interaction[:delegated_event_count]
+
+      report = ChatAnalyst.job(:chat_report, {file: parent}).run
+      delegation = report[:delegation]
+      assert_equal 156, report[:tokens][:deduplicated_total][:tt]
+      assert_equal 1, delegation[:linked_jobs]
+      assert_equal 6, delegation[:root_chat_tokens][:tt]
+      assert_equal 150, delegation[:delegated_tokens][:tt]
+      assert_equal delegation[:root_chat_tokens][:tt] + delegation[:delegated_tokens][:tt],
+                   report[:tokens][:deduplicated_total][:tt]
+      assert_equal 0, delegation[:unattributed_tokens][:tt]
+      assert_empty delegation[:unresolved_jobs]
+
+      accounting = ChatAnalyst.job(:chat_accounting, {file: parent}).run
+      entry = accounting[:entries].find { |e| e[:chat].include?('parent.chat') }
+      assert_equal 6, entry[:direct_tokens][:tt]
+      assert_equal 150, entry[:delegated_tokens][:tt]
+      assert_equal 156, entry[:tokens][:tt]
+      assert_equal 1, entry[:delegated_subtrees].length
+    end
+  end
+
+  # The generic fallback: any tool producing agent_meta receipts is treated
+  # as a delegation, even one this workflow has never heard of.
+  def test_agents_generic_receipt_fallback
+    Dir.mktmpdir do |dir|
+      parent, worker = fixture_agent_job(dir)
+      text = File.read(parent).sub('"name":"ask"', '"name":"custom_delegate"')
+      File.write(parent, text)
+      agents = ChatAnalyst.job(:chat_agents, {file: parent}).run
+      assert_equal 1, agents[:interactions].length, agents.inspect
+      assert_equal 'custom_delegate', agents[:interactions].first[:tool]
+    end
+  end
+
   def test_message_index_untouched_by_receipts
     Dir.mktmpdir do |dir|
       parent = fixture_receipt_only(dir)
