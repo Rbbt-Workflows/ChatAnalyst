@@ -14,6 +14,9 @@ other agents can be recorded as embedded receipts rather than saved
 child chats, so follow the provenance instead of assuming a single
 chat file contains the whole story. Judge costs, causality, and
 failures from the evidence locations, not from file or agent names.
+In current scout-ai, saved societies live under `.files/<name>.society/**`
+while legacy trees keep them under `.files/log/**`, so the path shape alone
+does not date a session.
 
 Costs, failure counts, and token figures you report must be read
 from the evidence (job metadata, chat_report outputs, receipts), not
