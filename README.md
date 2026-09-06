@@ -339,6 +339,70 @@ These references are not part of core provenance traversal, so this task is
 the complement of the core provenance tasks: use it to know exactly which
 chats a session imports, continues, or references with `last:`.
 
+## live_chats
+Discover the live chat logs of a session, newest first
+
+Pass a chat file or a job root (`file`). The task enumerates the chat logs of
+the session tree and returns them sorted by mtime, newest first, with `path`,
+`mtime`, `age` (seconds), `size`, and a `likely_active: true` flag on the
+newest entry — the log most likely receiving writes right now. On a job root
+the result also carries a `job` block with `status`, `running`, `done`,
+`error`, `aborted`, and `started`.
+
+Two sources are used, reported as `source`: `provenance` is the default — the
+same core traversal (`Chat.provenance_chat_files`) every other task uses, so
+job logs, society conversations, and result chats appear with the usual
+relation rules; `glob` is the fallback for sessions where traversal yields
+nothing (a damaged job, a chat that has not saved a receipt yet) — a bounded
+recursive glob of `Chat::DIRECT_LOG_CHAT_GLOBS` under `<root>.files/` that
+recovers whatever logs are physically on disk. Discovery never raises on
+damaged sessions.
+
+Use this first when you are asked to watch a running chat and need to know
+which `agent.chat` is logging the current work.
+
+## inbox_state
+Pending and delivered inbox messages of a chat
+
+Pass the chat file itself (the `save_file` whose inbox you inspect). The task
+returns `{save_file, files_dir, inbox_dir, inbox_removed_dir, pending,
+delivered}`: `pending` are the regular top-level files in `<chat>.files/inbox/`
+and `delivered` are the files in `<chat>.files/inbox_removed/` (sorted by
+name) — the record of everything already handed to the model. Each entry
+carries `name`, `mtime`, `size`, and the full `content`, because inbox notes
+are short advice by design.
+
+Missing directories yield empty lists, never an error: a chat that never
+received advice reports `pending: [], delivered: []`. Directory names come
+from `Chat::INBOX_DIR` / `Chat::INBOX_REMOVED_DIR`, so a rename in scout-ai is
+picked up automatically. The task rejects a job root with a
+`ParameterException`; pass the chat path directly.
+
+## post_inbox_advice
+Post advice into a live chat inbox
+
+Pass the chat file (`file`), the `message` text, and an optional `name` for
+the inbox file (default `<YYYYMMDD-HHMMSS>-advice.md`). The task creates
+`<chat>.files/inbox/<name>` (creating the directory with `mkdir_p`) with the
+message as content and returns the written path plus `name`, `save_file`,
+`inbox_dir`, `size`, and a `note` describing delivery semantics.
+
+This is the scout-ai `inbox` prompt strategy from the consumer side: the note
+is delivered as a `{role: 'user'}` message on the **next real inference** of
+that chat. Delivery is consume-once — the file is moved into
+`inbox_removed/` (mtime preserved, numeric `.1`, `.2` suffix on collision)
+before its content is read, so a notice can never be delivered twice — and
+cache hits skip the prompt preparation entirely, so a note posted while the
+chat is on cache stays pending until a real inference happens. Injected
+messages are seen by the model but never persisted in the transcript;
+`inbox_removed/` is the only delivery record. Confirm uptake by re-checking
+`inbox_state` for the file moving from `pending` to `delivered`.
+
+The name must be a plain file name (no `/`), the message must not be blank,
+and an existing inbox note is never silently overwritten. Because these tasks
+are jobs keyed on `file`, a repeated `inbox_state` call with the same input
+returns the cached result; use a distinct job id to force a fresh read.
+
 ## chat_accounting
 Separate accounting for a chat and every chat it imports
 

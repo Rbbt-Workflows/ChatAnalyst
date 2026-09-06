@@ -1179,8 +1179,156 @@ module ChatAnalyst
     }
   end
 
+  # --- inbox access (live advice injection) ---
+
+  # One chat log as a compact live-chat entry. Files are reported with path,
+  # mtime, age, size and a likely_active flag for the newest log, so the task
+  # answers "which chat is being written right now" without reading content.
+  helper :live_chat_entry do |path, reference_time, likely_active: false|
+    mtime = File.mtime(path)
+    {
+      path: short_path(path),
+      mtime: mtime.iso8601,
+      age: (reference_time - mtime).round(3),
+      size: File.size(path),
+      likely_active: likely_active
+    }
+  end
+
+  # Live-chat discovery. Provenance traversal is the primary source: it
+  # enumerates exactly the chat logs of the session tree (job logs, society
+  # conversations, result chats) using the same relation rules as every other
+  # task. When traversal yields nothing - a running chat that has not saved a
+  # job yet, a damaged session - a bounded recursive glob of
+  # Chat::DIRECT_LOG_CHAT_GLOBS under `<root>.files/` recovers the logs
+  # physically present on disk, and the entry says which mode was used.
+  helper :live_chat_files do |root_kind, root|
+    found = []
+    on_error = lambda do |_error, _kind, _object, _relation, _reference|
+      # Discovery never raises on damaged sessions: warnings are dropped here
+      # because chat_report/chat_overview already surface provenance problems.
+    end
+    begin
+      found = Chat.provenance_chat_files(root, root_type: root_kind, on_error: on_error)
+    rescue StandardError
+      found = []
+    end
+    source = :provenance
+
+    if found.empty?
+      files_dir = root_kind == :job ? root.files_dir.to_s : (root.to_s + '.files')
+      if File.directory?(files_dir)
+        found = Chat::DIRECT_LOG_CHAT_GLOBS
+                .flat_map { |pattern| Dir.glob(File.join(files_dir, '**', pattern)) }
+                .collect { |file| File.expand_path(file) }
+                .select { |file| File.file?(file) }
+                .uniq
+      end
+      source = :glob
+    end
+
+    [found.sort, source]
+  end
+
+  input :file, :string, 'Chat file or chat-producing job root', nil, required: true, jobname: true, nofile: true
+  desc 'Discover the live chat logs of a session, newest first, flagging the one most likely to be receiving writes.'
+  task :live_chats => :json do |file|
+    root_kind, root = resolve_root(file)
+    files, source = live_chat_files(root_kind, root)
+
+    reference = Time.now
+    entries = files.collect { |path| live_chat_entry(path, reference) }
+                    .sort_by { |entry| [-Time.parse(entry[:mtime]).to_i, entry[:path]] }
+    entries.first[:likely_active] = true unless entries.empty?
+
+    {
+      root: short_path(Chat.provenance_path(root_kind, root)),
+      root_kind: root_kind,
+      chats: entries,
+      total: entries.length,
+      source: source,
+      job: root_kind == :job ? {
+        status: root.status,
+        running: root.running?,
+        done: root.done?,
+        error: root.error?,
+        aborted: root.aborted?,
+        started: root.started?
+      } : nil
+    }
+  end
+
+  # Inbox file description: full content included, because inbox notes are
+  # short by design and the whole point of the state task is to read them.
+  helper :inbox_entry do |path|
+    mtime = File.mtime(path)
+    {
+      name: File.basename(path),
+      mtime: mtime.iso8601,
+      size: File.size(path),
+      content: Open.read(path)
+    }
+  end
+
+  input :file, :string, 'Chat file (the save_file whose inbox is inspected)', nil, required: true, jobname: true, nofile: true
+  desc 'Pending and delivered inbox messages of a chat, with full content; missing directories are empty lists, never errors.'
+  task :inbox_state => :json do |file|
+    root_kind, root = resolve_root(file)
+    raise ParameterException, 'inbox_state requires a chat file root; pass the chat path directly' unless root_kind == :chat
+
+    save_file = File.expand_path(root.to_s)
+    files_dir = save_file + '.files'
+    inbox_dir = File.join(files_dir, Chat::INBOX_DIR)
+    removed_dir = File.join(files_dir, Chat::INBOX_REMOVED_DIR)
+
+    pending = File.directory?(inbox_dir) ? Dir.glob(File.join(inbox_dir, '*')).select { |f| File.file?(f) }.sort : []
+    delivered = File.directory?(removed_dir) ? Dir.glob(File.join(removed_dir, '*')).select { |f| File.file?(f) }.sort_by { |f| File.basename(f) } : []
+
+    {
+      save_file: short_path(save_file),
+      files_dir: short_path(files_dir),
+      inbox_dir: short_path(inbox_dir),
+      inbox_removed_dir: short_path(removed_dir),
+      pending: pending.collect { |path| inbox_entry(path) },
+      delivered: delivered.collect { |path| inbox_entry(path) }
+    }
+  end
+
+  input :file, :string, 'Chat file (the save_file whose inbox receives the advice)', nil, required: true, jobname: true, nofile: true
+  input :message, :string, 'Advice text to deliver on the next real inference', nil, required: true, nofile: true
+  input :name, :string, 'Inbox file name (default: timestamped advice note)', nil, nofile: true
+  desc 'Post advice into a live chat inbox; it is delivered as a user message on the next real inference and never persisted in the transcript.'
+  task :post_inbox_advice => :json do |file, message, name|
+    root_kind, root = resolve_root(file)
+    raise ParameterException, 'post_inbox_advice requires a chat file root; pass the chat path directly' unless root_kind == :chat
+
+    name = name.to_s.strip
+    name = nil if name.empty?
+    raise ParameterException, 'Inbox note name must be a plain file name, not a path' if name && name.include?('/')
+    raise ParameterException, 'Advice message must not be empty' if message.to_s.strip.empty?
+
+    name ||= Time.now.strftime('%Y%m%d-%H%M%S') + '-advice.md'
+    save_file = File.expand_path(root.to_s)
+    inbox_dir = File.join(save_file + '.files', Chat::INBOX_DIR)
+    FileUtils.mkdir_p(inbox_dir)
+
+    target = File.join(inbox_dir, name)
+    raise ParameterException, "Inbox note already exists: #{name}" if File.exist?(target)
+    Open.write(target, message)
+
+    {
+      posted: short_path(target),
+      name: name,
+      save_file: short_path(save_file),
+      inbox_dir: short_path(inbox_dir),
+      size: File.size(target),
+      note: 'delivered as a user message on the next real inference; consume-once; the moved file in inbox_removed/ is the delivery record'
+    }
+  end
+
+
   export_exec :message_index, :message_content, :chat_overview,
               :chat_tool_calls, :chat_tokens, :chat_agents, :meta_evidence,
               :chat_reasoning, :chat_report, :provenance_relationships,
-              :chat_accounting
+              :chat_accounting, :live_chats, :inbox_state, :post_inbox_advice
 end

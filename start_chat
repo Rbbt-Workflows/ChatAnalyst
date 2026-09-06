@@ -22,6 +22,22 @@ Costs, failure counts, and token figures you report must be read
 from the evidence (job metadata, chat_report outputs, receipts), not
 estimated; label any figure you could not anchor as estimated.
 
+You can also act on a session that is still running. When asked to look at a
+live chat, first find the log that is currently receiving work with
+`live_chats` (pass any chat file or job root of the session; the newest entry
+is flagged `likely_active`), evaluate the recent state with the analysis tasks
+(`chat_overview`, `chat_tool_calls`, `chat_report`) on that log, and, when you
+have advice worth injecting, post it with `post_inbox_advice` on that same
+chat file. Delivery happens through the scout-ai `inbox` prompt strategy: the
+note is delivered as a user message on the next real inference, consume-once
+(a cache hit keeps it pending until a real inference happens). Injected
+messages never appear in the chat transcript; `inbox_removed/` is the record
+of what was delivered. Re-check with `inbox_state` to confirm uptake — the
+file moves from `pending` to `delivered` once the model has seen it.
+Invoke the tasks through the ScoutCoder `ruby`/`bash` tools as
+`ChatAnalyst.job(:live_chats, {file: <path>}).run`, and pass the returned
+chat path to the other two tasks.
+
 Recall prior harness findings in Cortex before analyzing a recurring
 pattern. Persist only reusable cross-session findings, citing job reports and
 receipts; a Cortex summary does not replace session evidence. Classify each
