@@ -1230,15 +1230,119 @@ module ChatAnalyst
     [found.sort, source]
   end
 
+  # --- in-flight delegations, discovered through transient `.jobs` files ---
+
+  # Depth cap when following `.jobs` files: the file that seeded the walk
+  # plus one jobs-of-jobs level, i.e. a chat discovered in flight that is
+  # itself delegating. Chains deeper than that are better served by settled
+  # provenance, which records the whole delegation tree once the jobs finish
+  # and their receipts are saved; each extra level costs one directory scan
+  # per live chat for a situation that is rare while it is still unfolding.
+  JOBS_FILE_MAX_DEPTH = 2
+
+  # The `.jobs` file of a save_file, reproducing the writer byte for byte
+  # (scout-ai `Chat.jobs_file(save_file)`:
+  # `save_file.sub(/\.chat\z/,'') + '.jobs'`). The sub is anchored at the
+  # extension, so a sidecar save_file 'parent.chat.files/agent.chat' derives
+  # 'parent.chat.files/agent.jobs', the sibling of the chat file itself.
+  # (The pre-2.0.0 writer matched the FIRST '.chat' in the string and
+  # produced 'parent.files/agent.chat.jobs'; that misfire was corrected in
+  # scout-ai and is matched here by the anchored form.)
+  helper :jobs_file_for_save_file do |save_file|
+    save_file.to_s.sub(/\.chat\z/, '') + '.jobs'
+  end
+
+  # Job references listed in one `.jobs` file: bare `Step#short_path` lines.
+  # The file exists only while its jobs are in flight (removed in the ensure
+  # after Workflow.produce), so existence is re-checked and a mid-read
+  # disappearance degrades to no references instead of an error.
+  helper :jobs_file_references do |jobs_file|
+    return [] unless Open.exists?(jobs_file) && File.file?(jobs_file)
+    Open.read(jobs_file).split("\n").collect(&:strip).reject(&:empty?)
+  rescue StandardError
+    []
+  end
+
+  # Chat logs of every job referenced by one `.jobs` file. Each reference is
+  # guarded: the job directory may disappear before loading, or a short_path
+  # may not resolve at all - a broken reference is skipped, never raised.
+  helper :jobs_file_chats do |jobs_file|
+    jobs_file_references(jobs_file)
+           .filter_map do |reference|
+             step = (Chat.load_job_reference(reference) rescue nil)
+             next nil unless step && Chat.job_reference_candidate?(step.path.to_s)
+             Chat.direct_job_chat_files(step)
+                  .collect { |path| {path: File.expand_path(path.to_s), jobs_file: jobs_file} }
+           end
+           .flatten
+  end
+
+  # Live chats that only the transient `.jobs` files can see: workflow-
+  # delegated inferences (a Cortex cortex_continue child, a Worker job) with
+  # no settled provenance yet. Seeds come from every save_file already in
+  # scope (the discovered chats, plus a chat root itself) and from a `*.jobs`
+  # glob over the session files-dir; each discovered chat may be delegating
+  # in turn, so its own `.jobs` file is followed while the depth cap allows,
+  # with a visited set on both files and chats so the walk cannot loop.
+  helper :jobs_chats_in_flight do |files_dir, save_files|
+    seeds = save_files.collect { |save_file| jobs_file_for_save_file(save_file) }
+    seeds.concat(Dir.glob(File.join(files_dir, '**', '*.jobs'))) if files_dir && File.directory?(files_dir)
+    seeds = seeds.collect { |path| File.expand_path(path.to_s) }
+                  .select { |path| Open.exists?(path) && File.file?(path) }
+                  .uniq
+
+    found = []
+    seen_files, seen_chats = {}, {}
+    frontier = seeds.collect { |path| [path, 1] }
+    until frontier.empty?
+      jobs_file, depth = frontier.shift
+      next if seen_files[jobs_file]
+      seen_files[jobs_file] = true
+
+      jobs_file_chats(jobs_file).each do |entry|
+        next if seen_chats[entry[:path]]
+        seen_chats[entry[:path]] = true
+        found << entry
+        frontier << [jobs_file_for_save_file(entry[:path]), depth + 1] if depth < JOBS_FILE_MAX_DEPTH
+      end
+    end
+    found
+  end
+
   input :file, :string, 'Chat file or chat-producing job root', nil, required: true, jobname: true, nofile: true
   desc 'Discover the live chat logs of a session, newest first, flagging the one most likely to be receiving writes.'
   task :live_chats => :json do |file|
     root_kind, root = resolve_root(file)
-    files, source = live_chat_files(root_kind, root)
+    files, primary_source = live_chat_files(root_kind, root)
+
+    # In-flight delegations are invisible to settled provenance: the receipts
+    # that would connect parent and child only land once the parent inference
+    # finishes, so a live delegated child has no provenance edge yet. The
+    # transient `.jobs` files add those children as a third source.
+    files_dir = root_kind == :job ? root.files_dir.to_s : (root.to_s + '.files')
+    save_files = files.dup
+    save_files << root.to_s if root_kind == :chat
+    in_flight = jobs_chats_in_flight(files_dir, save_files)
+
+    # Settled provenance or the glob fallback win over `.jobs` for the same
+    # file: an entry found that way carries a durable explanation, while the
+    # `.jobs` route only says "referenced while running".
+    known = files.collect { |path| File.expand_path(path.to_s) }
+    in_flight.reject! { |entry| known.include?(entry[:path]) }
 
     reference = Time.now
-    entries = files.collect { |path| live_chat_entry(path, reference) }
-                    .sort_by { |entry| [-Time.parse(entry[:mtime]).to_i, entry[:path]] }
+    entries = files.collect { |path| live_chat_entry(path, reference).merge(source: primary_source) }
+    entries.concat(in_flight.filter_map do |entry|
+                     begin
+                       live_chat_entry(entry[:path], reference)
+                         .merge(source: :jobs, jobs_file: short_path(entry[:jobs_file]))
+                     rescue StandardError
+                       # the chat vanished while being read: the delegated
+                       # job finished and cleaned up; report nothing for it
+                       nil
+                     end
+                   end)
+    entries = entries.sort_by { |entry| [-Time.parse(entry[:mtime]).to_i, entry[:path]] }
     entries.first[:likely_active] = true unless entries.empty?
 
     {
@@ -1246,7 +1350,10 @@ module ChatAnalyst
       root_kind: root_kind,
       chats: entries,
       total: entries.length,
-      source: source,
+      # The mode that produced the reported chats: the traversal mode when
+      # it found anything, :jobs when only in-flight discovery did; when
+      # nothing was found the fallback mode is kept, as before.
+      source: files.any? ? primary_source : (in_flight.any? ? :jobs : primary_source),
       job: root_kind == :job ? {
         status: root.status,
         running: root.running?,
@@ -1278,19 +1385,32 @@ module ChatAnalyst
 
     save_file = File.expand_path(root.to_s)
     files_dir = save_file + '.files'
-    inbox_dir = File.join(files_dir, Chat::INBOX_DIR)
-    removed_dir = File.join(files_dir, Chat::INBOX_REMOVED_DIR)
+    # scout-ai owns the inbox location (per-save-file sibling of the save
+    # file, not a subdir of <save_file>.files); the helpers are the only
+    # sanctioned way to derive it.
+    inbox_dir = Chat.inbox_dir(save_file)
+    removed_dir = Chat.inbox_removed_dir(save_file)
 
-    pending = File.directory?(inbox_dir) ? Dir.glob(File.join(inbox_dir, '*')).select { |f| File.file?(f) }.sort : []
-    delivered = File.directory?(removed_dir) ? Dir.glob(File.join(removed_dir, '*')).select { |f| File.file?(f) }.sort_by { |f| File.basename(f) } : []
+    # The inbox is read while a live inference may be consuming it: a note
+    # that moves between listing and reading is a race that resolves by
+    # skipping the entry, never by failing the whole report.
+    describe_inbox_files = lambda do |dir|
+      (File.directory?(dir) ? Dir.glob(File.join(dir, '*')).select { |f| File.file?(f) } : [])
+        .collect { |path| (inbox_entry(path) rescue nil) }
+        .compact
+        .sort_by { |entry| entry[:name] }
+    end
+
+    pending = describe_inbox_files.call(inbox_dir)
+    delivered = describe_inbox_files.call(removed_dir)
 
     {
       save_file: short_path(save_file),
       files_dir: short_path(files_dir),
       inbox_dir: short_path(inbox_dir),
       inbox_removed_dir: short_path(removed_dir),
-      pending: pending.collect { |path| inbox_entry(path) },
-      delivered: delivered.collect { |path| inbox_entry(path) }
+      pending: pending,
+      delivered: delivered
     }
   end
 
@@ -1307,9 +1427,18 @@ module ChatAnalyst
     raise ParameterException, 'Inbox note name must be a plain file name, not a path' if name && name.include?('/')
     raise ParameterException, 'Advice message must not be empty' if message.to_s.strip.empty?
 
+    # An inbox file named 'abort' is a reserved control signal, not a note:
+    # scout-ai consumes it once and aborts the live inference without ever
+    # showing its content to the model. Advice must never be able to kill an
+    # inference, so the reserved name is rejected before anything is written.
+    if name == Chat::INBOX_ABORT_FILE
+      raise ParameterException,
+            "Inbox note name '#{name}' is reserved: it would abort the live inference instead of delivering advice; pick another name"
+    end
+
     name ||= Time.now.strftime('%Y%m%d-%H%M%S') + '-advice.md'
     save_file = File.expand_path(root.to_s)
-    inbox_dir = File.join(save_file + '.files', Chat::INBOX_DIR)
+    inbox_dir = Chat.inbox_dir(save_file)
     FileUtils.mkdir_p(inbox_dir)
 
     target = File.join(inbox_dir, name)

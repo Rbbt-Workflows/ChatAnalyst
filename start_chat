@@ -28,12 +28,21 @@ live chat, first find the log that is currently receiving work with
 is flagged `likely_active`), evaluate the recent state with the analysis tasks
 (`chat_overview`, `chat_tool_calls`, `chat_report`) on that log, and, when you
 have advice worth injecting, post it with `post_inbox_advice` on that same
-chat file. Delivery happens through the scout-ai `inbox` prompt strategy: the
+chat file. Each entry reports its source: `provenance` (settled), `glob`
+(fallback), or `jobs` — delegated inferences still running, known only
+through scout-ai's transient `.jobs` files, which vanish once the jobs
+finish; a `jobs` chat is an ephemeral signal of live work, not durable
+provenance. Delivery happens through the scout-ai `inbox` prompt strategy:
+each save_file has its own sibling inbox (`<chat>.files/<agent>.inbox` for a
+sidecar agent chat, `parent.inbox` next to a top-level `parent.chat`); the
 note is delivered as a user message on the next real inference, consume-once
 (a cache hit keeps it pending until a real inference happens). Injected
-messages never appear in the chat transcript; `inbox_removed/` is the record
-of what was delivered. Re-check with `inbox_state` to confirm uptake — the
-file moves from `pending` to `delivered` once the model has seen it.
+messages never appear in the chat transcript; the matching
+`.inbox_removed` directory is the record of what was delivered. Re-check
+with `inbox_state` to confirm uptake — the file moves from `pending` to
+`delivered` once the model has seen it. Note names are plain file names, and
+the name `abort` is rejected: that name is a scout-ai control signal that
+kills the live inference instead of delivering advice.
 Invoke the tasks through the ScoutCoder `ruby`/`bash` tools as
 `ChatAnalyst.job(:live_chats, {file: <path>}).run`, and pass the returned
 chat path to the other two tasks.

@@ -63,6 +63,29 @@ module ChatAnalystFixtures
 
   # --- Named scenario layouts -------------------------------------------
 
+  # 0) Resolved cortex_continue delegation: receipt job= reference to a child
+  # job whose own log chat carries the delegated token event. Current layout:
+  # job chats sit directly under <job>.files/ with an .info sidecar.
+  # Resolved cortex_continue delegation: receipt job= reference to a child job
+  # whose own log chat carries the delegated token event.
+  def fixture_cortex_continue(dir)
+    worker = File.join(dir, 'Cortex/continue/Default_1')
+    worker_chat = "user: run worker\n" +
+                  "meta: pt=100 ct=50 tt=150 inference_id=c1\n" +
+                  "assistant: delegated answer\n"
+    FileUtils.mkdir_p(worker + '.files')
+    File.write(worker + '.files/agent.chat', worker_chat)
+    File.write(worker, 'delegated answer')
+    File.write(worker + '.info', {status: 'done', dependencies: []}.to_json)
+    parent = File.join(dir, 'parent.chat')
+    File.write(parent, "user: go\n" +
+      'function_call: ' + %({"name":"cortex_continue","arguments":{"agent":"Worker","conversation":"c1"},"id":"a1"}) + "\n" +
+      'function_call_output: ' + %({"name":"cortex_continue","content":"delegated answer","id":"a1","agent_meta":[{"role":"meta","content":"job=#{worker}"}]}) + "\n" +
+      "meta: pt=3 ct=2 tt=6 inference_id=p1\n" +
+      "assistant: done\n")
+    [parent, worker]
+  end
+
   # 1) Receipt-only socialized delegation: the parent holds two direct child
   # events in agent_meta and no Worker chat/log/job exists anywhere.
   def fixture_receipt_only(dir)

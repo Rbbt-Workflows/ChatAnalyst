@@ -349,14 +349,42 @@ newest entry — the log most likely receiving writes right now. On a job root
 the result also carries a `job` block with `status`, `running`, `done`,
 `error`, `aborted`, and `started`.
 
-Two sources are used, reported as `source`: `provenance` is the default — the
-same core traversal (`Chat.provenance_chat_files`) every other task uses, so
-job logs, society conversations, and result chats appear with the usual
-relation rules; `glob` is the fallback for sessions where traversal yields
-nothing (a damaged job, a chat that has not saved a receipt yet) — a bounded
-recursive glob of `Chat::DIRECT_LOG_CHAT_GLOBS` under `<root>.files/` that
-recovers whatever logs are physically on disk. Discovery never raises on
-damaged sessions.
+Three sources are used, reported per entry as `source`: `provenance` is the
+default — the same core traversal (`Chat.provenance_chat_files`) every other
+task uses, so job logs, society conversations, and result chats appear with
+the usual relation rules; `glob` is the fallback for sessions where traversal
+yields nothing (a damaged job, a chat that has not saved a receipt yet) — a
+bounded recursive glob of `Chat::DIRECT_LOG_CHAT_GLOBS` under `<root>.files/`
+that recovers whatever logs are physically on disk; `jobs` adds workflow-
+delegated inferences that are **still running** — chats whose parent has not
+finished, so no provenance edge exists yet.
+
+The `jobs` source is derived from the transient `.jobs` files scout-ai keeps
+next to every chat save_file while delegated jobs are in flight: each holds
+bare `Step#short_path` lines (one per not-yet-done job). Those jobs are
+loaded and their files_dir scanned for `.chat` logs. The file exists only
+while its jobs are in flight (removed once they finish, success or failure,
+when the settled receipts land in the chat), so `jobs` entries are ephemeral
+signals of live work, not durable provenance — treat a chat that disappears
+from the `jobs` source as finished, not as gone. They carry an extra
+`jobs_file` field naming the `.jobs` file they were found through, and
+`provenance`/`glob` always win over `jobs` for the same chat, so nothing is
+reported twice. Discovery is seeded from the `.jobs` sibling of every
+save_file already in scope plus a `**/*.jobs` glob under the session
+files-dir, follows a discovered chat's own `.jobs` file up to depth 2 (the
+seeding file plus one jobs-of-jobs level — deeper chains are settled
+provenance territory by the time they matter), and guards every step: a
+missing job directory, an unresolvable reference, or a `.jobs` file that
+vanishes mid-read is skipped silently. Discovery never raises on damaged
+sessions.
+
+The `.jobs` path is derived exactly as scout-ai's writer derives it
+(`save_file.sub(/\.chat\z/, '') + '.jobs'`, anchored at the **extension**, so
+a sidecar save_file `parent.chat.files/agent.chat` has its `.jobs` at
+`parent.chat.files/agent.jobs`, i.e. the sibling of the chat file itself).
+The derivation is kept identical to scout-ai's
+`Chat.jobs_file(save_file)` so in-flight jobs are always found at the path
+the writer actually uses.
 
 Use this first when you are asked to watch a running chat and need to know
 which `agent.chat` is logging the current work.
@@ -366,42 +394,54 @@ Pending and delivered inbox messages of a chat
 
 Pass the chat file itself (the `save_file` whose inbox you inspect). The task
 returns `{save_file, files_dir, inbox_dir, inbox_removed_dir, pending,
-delivered}`: `pending` are the regular top-level files in `<chat>.files/inbox/`
-and `delivered` are the files in `<chat>.files/inbox_removed/` (sorted by
-name) — the record of everything already handed to the model. Each entry
-carries `name`, `mtime`, `size`, and the full `content`, because inbox notes
-are short advice by design.
+delivered}`: the inbox is a per-save-file sibling of the save_file, derived
+with the scout-ai helpers `Chat.inbox_dir` / `Chat.inbox_removed_dir` — for a
+sidecar agent save_file `<chat>.files/<agent>.chat` it is
+`<chat>.files/<agent>.inbox{,_removed}`, and for a top-level `parent.chat` it
+is `parent.inbox{,_removed}` in the same directory. `pending` are the regular
+top-level files in the inbox, `delivered` the files in the removed directory
+(sorted by name) — the record of everything already handed to the model.
+Each entry carries `name`, `mtime`, `size`, and the full `content`, because
+inbox notes are short advice by design.
 
 Missing directories yield empty lists, never an error: a chat that never
-received advice reports `pending: [], delivered: []`. Directory names come
-from `Chat::INBOX_DIR` / `Chat::INBOX_REMOVED_DIR`, so a rename in scout-ai is
-picked up automatically. The task rejects a job root with a
-`ParameterException`; pass the chat path directly.
+received advice reports `pending: [], delivered: []`. The inbox is read while
+a live inference may be consuming it, so each entry is guarded: a note that
+disappears between listing and reading is skipped, never an error. The task
+rejects a job root with a `ParameterException`; pass the chat path directly.
 
 ## post_inbox_advice
 Post advice into a live chat inbox
 
 Pass the chat file (`file`), the `message` text, and an optional `name` for
 the inbox file (default `<YYYYMMDD-HHMMSS>-advice.md`). The task creates
-`<chat>.files/inbox/<name>` (creating the directory with `mkdir_p`) with the
+the note `<name>` inside the save_file's sibling inbox
+(`Chat.inbox_dir(save_file)`; creating the directory with `mkdir_p`) with the
 message as content and returns the written path plus `name`, `save_file`,
-`inbox_dir`, `size`, and a `note` describing delivery semantics.
+`inbox_dir`, `size`, and a `note` describing delivery semantics. To advise a
+live chat discovered with `live_chats`, post against that chat's own
+save_file so the note lands in its own inbox.
 
 This is the scout-ai `inbox` prompt strategy from the consumer side: the note
 is delivered as a `{role: 'user'}` message on the **next real inference** of
-that chat. Delivery is consume-once — the file is moved into
-`inbox_removed/` (mtime preserved, numeric `.1`, `.2` suffix on collision)
-before its content is read, so a notice can never be delivered twice — and
+that chat. Delivery is consume-once — the file is moved into the save_file's
+sibling `.inbox_removed` directory (mtime preserved, numeric `.1`, `.2`
+suffix on collision) before its content is read, so a notice can never be
+delivered twice — and
 cache hits skip the prompt preparation entirely, so a note posted while the
 chat is on cache stays pending until a real inference happens. Injected
 messages are seen by the model but never persisted in the transcript;
-`inbox_removed/` is the only delivery record. Confirm uptake by re-checking
-`inbox_state` for the file moving from `pending` to `delivered`.
+that removed directory is the only delivery record. Confirm uptake by
+re-checking `inbox_state` for the file moving from `pending` to `delivered`.
 
 The name must be a plain file name (no `/`), the message must not be blank,
-and an existing inbox note is never silently overwritten. Because these tasks
-are jobs keyed on `file`, a repeated `inbox_state` call with the same input
-returns the cached result; use a distinct job id to force a fresh read.
+and an existing inbox note is never silently overwritten. The name `abort` is
+reserved (scout-ai's `Chat::INBOX_ABORT_FILE`): a file with that name is
+consumed to abort the live inference and its content never reaches the model,
+so posting advice under it raises a `ParameterException` before anything is
+written — advice must never be able to kill an inference. Because these
+tasks are jobs keyed on `file`, a repeated `inbox_state` call with the same
+input returns the cached result; use a distinct job id to force a fresh read.
 
 ## chat_accounting
 Separate accounting for a chat and every chat it imports
