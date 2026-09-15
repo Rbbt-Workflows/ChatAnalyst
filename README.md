@@ -389,6 +389,11 @@ the writer actually uses.
 Use this first when you are asked to watch a running chat and need to know
 which `agent.chat` is logging the current work.
 
+From a chat root, the top-level `<chat>.files/<name>.chat` agent transcript is
+part of the provenance set (it is where the session's `meta job=` references
+live); only a top-level file that is byte-identical to the root conversation —
+a legacy root copy — is excluded.
+
 ## inbox_state
 Pending and delivered inbox messages of a chat
 

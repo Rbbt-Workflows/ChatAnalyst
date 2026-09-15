@@ -182,7 +182,9 @@ class TestInboxTasks < Test::Unit::TestCase
 
   def test_live_chats_chat_root_uses_sidecar_society_chats
     # A chat root keeps its own file plus society conversations from the
-    # .files sidecar; the top-level root copy is excluded by core provenance.
+    # .files sidecar; core provenance only excludes a top-level file that is
+    # byte-identical to the root conversation (this fixture has none), the
+    # agent transcript sidecar itself is traversed (see the test below).
     chat = File.join(@dir, 'live.chat')
     File.write(chat, "user: live\n")
     files = File.join(@dir, 'live.chat.files')
@@ -194,6 +196,51 @@ class TestInboxTasks < Test::Unit::TestCase
     assert_equal :provenance, result[:source]
     paths = result[:chats].collect { |c| c[:path] }
     assert_equal [chat, File.join(files, 'ask.society', 'child.chat')], paths
+  end
+
+  def test_live_chats_chat_root_follows_top_level_transcript_refs
+    # The Lean regression: a session chat whose ROOT file carries no job
+    # references keeps them in the top-level `.files/agent.chat` agent
+    # transcript.  live_chats on the chat root must traverse that transcript,
+    # reach the referenced job tree, and list exactly the same working set as
+    # a sidecar-rooted run plus the root file itself.
+    job = File.join(@dir, 'Planned', 'work', 'Default_w')
+    job_files = job + '.files'
+    FileUtils.mkdir_p(File.join(job_files, 'ask.society'))
+    File.write(job, 'work answer')
+    File.write(job + '.info', {dependencies: [], status: 'done'}.to_json)
+    File.write(File.join(job_files, 'agent.chat'), "user: work\n")
+    File.write(File.join(job_files, 'ask.society', 'worker_child.chat'), "user: child\n")
+
+    chat = File.join(@dir, 'session.chat')
+    File.write(chat, "user: hi\nassistant: done\n")
+    files = chat + '.files'
+    FileUtils.mkdir_p(files)
+    # Transcript: not a copy of the root -- it carries the job reference.
+    File.write(File.join(files, 'agent.chat'),
+               "system: harness\nuser: hi\nassistant: done\n" \
+               "user: go\nmeta: job=#{job}\nassistant: done\n")
+
+    root_run = ChatAnalyst.job(:live_chats, {file: chat}).run
+    assert_equal :provenance, root_run[:source]
+    root_paths = root_run[:chats].collect { |c| c[:path] }
+
+    transcript = File.join(files, 'agent.chat')
+    assert_include root_paths, transcript,
+                   'the top-level agent transcript must be listed from a chat root'
+    assert_include root_paths, File.join(job_files, 'agent.chat'),
+                   'the referenced job log chat must be reached'
+    assert_include root_paths, File.join(job_files, 'ask.society', 'worker_child.chat'),
+                   'the referenced job society chat must be reached'
+
+    # Equivalence with the explicit-sidecar invocation: the sidecar-rooted
+    # working set is unchanged by the core patch, and the chat-rooted set is
+    # exactly that set plus the root file.
+    sidecar_run = ChatAnalyst.job(:live_chats, fresh_id('sidecar-root'),
+                                  {file: transcript}).run
+    sidecar_paths = sidecar_run[:chats].collect { |c| c[:path] }
+    assert_equal root_paths.length, sidecar_paths.length + 1
+    assert_equal (sidecar_paths + [chat]).sort, root_paths.sort
   end
 
   def test_live_chats_rejects_missing_file
