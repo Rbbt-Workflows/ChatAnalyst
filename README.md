@@ -153,6 +153,14 @@ are marked unresolved and may be over-counted when no child log exists.
 
 # Tasks
 
+## extract_chat_range
+Extract an inclusive zero-based message range from one persisted `.chat` file.
+
+The required `file`, `start`, and `end` inputs are validated against messages
+parsed by `Chat.load`; selected messages are serialized with `Chat.print`,
+without agent inference or compilation. By default serialized `.chat` content
+is returned.
+
 ## message_index
 Return a compact index of every discovered message
 

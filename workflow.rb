@@ -533,7 +533,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :role, :string, 'Optional role filter', nil, nofile: true
   input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
   input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
@@ -570,7 +570,19 @@ module ChatAnalyst
     messages
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :start, :integer, 'Zero-based first message (inclusive)', 0
+  input :end, :integer, 'Zero-based last message (inclusive)', nil, required: true
+  task :extract_chat_range => :chat do |file, start, ending|
+    raise ParameterException, "Chat file not found: #{file}" unless File.file?(file.to_s)
+    chat = Chat.load(file.to_s)
+    raise ParameterException, 'start must be non-negative' if start < 0
+    raise ParameterException, 'end must be greater than or equal to start' if ending < start
+    raise ParameterException, "Message range #{start}..#{ending} is outside chat (#{chat.length} messages)" if ending >= chat.length
+    Chat.print(chat[start..ending])
+  end
+
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :ids, :array, 'Flat string IDs ("path#index") from message_index or chat_tool_calls', nil, required: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   desc 'Retrieve full message content by flat string ID ("path#index").'
@@ -593,7 +605,7 @@ module ChatAnalyst
     end
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   desc 'Structural chats, jobs, and typed provenance relations, including delegated agent_job edges.'
   task :chat_overview => :json do |file, follow|
@@ -651,7 +663,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
   input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
@@ -680,7 +692,7 @@ module ChatAnalyst
     result
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
   input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
@@ -722,7 +734,7 @@ module ChatAnalyst
     result
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
   input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
@@ -812,7 +824,7 @@ module ChatAnalyst
     result
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :origin, :string, 'Optional origin filter (chat_meta or agent_meta)', nil, nofile: true
   input :full, :boolean, 'Return untruncated meta values and raw receipt messages', false, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
@@ -871,7 +883,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :addresses, :array, 'Optional evidence addresses; returns full reasoning for exactly those items', nil, nofile: true
   input :full, :boolean, 'Return full reasoning text instead of fingerprints', false, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
@@ -943,7 +955,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   desc 'Concise combined provenance, token, and delegation snapshot.'
   task :chat_report => :json do |file, follow|
@@ -1052,7 +1064,7 @@ module ChatAnalyst
   end
 
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   desc 'Chat-level import/continue/last reference events and their import closure, reported separately from core provenance.'
   task :provenance_relationships => :json do |file|
     root_kind, root = resolve_root(file)
@@ -1086,7 +1098,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :follow, :string, 'Provenance relations to follow: "all" or comma/space separated subset of job, dependency, log, result, agent_job', 'all', nofile: true
   input :scope, :string, "Accounting scope: 'own' (default) accounts each chat in the import closure separately from its own file; 'closure' merges the whole closure into one root entry", 'own', nofile: true
   desc 'Separate accounting for a chat and every chat it imports, without merging imported costs into the root. Each own-scope entry also splits its tokens into direct_tokens (canonical evidence in the chat file itself) and delegated_tokens (canonical evidence in agent_job subtrees); the tokens field keeps its full subtree-inclusive meaning when follow includes agent_job.'
@@ -1309,7 +1321,7 @@ module ChatAnalyst
     found
   end
 
-  input :file, :string, 'Chat file or chat-producing job root', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Chat file or chat-producing job root', nil, required: true, jobname: true, nofile: true
   desc 'Discover the live chat logs of a session, newest first, flagging the one most likely to be receiving writes.'
   task :live_chats => :json do |file|
     root_kind, root = resolve_root(file)
@@ -1377,7 +1389,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Chat file (the save_file whose inbox is inspected)', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Chat file (the save_file whose inbox is inspected)', nil, required: true, jobname: true, nofile: true
   desc 'Pending and delivered inbox messages of a chat, with full content; missing directories are empty lists, never errors.'
   task :inbox_state => :json do |file|
     root_kind, root = resolve_root(file)
@@ -1414,7 +1426,7 @@ module ChatAnalyst
     }
   end
 
-  input :file, :string, 'Chat file (the save_file whose inbox receives the advice)', nil, required: true, jobname: true, nofile: true
+  input :file, :path, 'Chat file (the save_file whose inbox receives the advice)', nil, required: true, jobname: true, nofile: true
   input :message, :string, 'Advice text to deliver on the next real inference', nil, required: true, nofile: true
   input :name, :string, 'Inbox file name (default: timestamped advice note)', nil, nofile: true
   desc 'Post advice into a live chat inbox; it is delivered as a user message on the next real inference and never persisted in the transcript.'
@@ -1460,4 +1472,6 @@ module ChatAnalyst
               :chat_tool_calls, :chat_tokens, :chat_agents, :meta_evidence,
               :chat_reasoning, :chat_report, :provenance_relationships,
               :chat_accounting, :live_chats, :inbox_state, :post_inbox_advice
+
+  export :extract_chat_range
 end
