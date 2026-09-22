@@ -20,7 +20,7 @@ module ChatAnalyst
   # :dependency, which would attribute upstream jobs to the delegation.
   DELEGATION_SUBTREE_RELATIONS = %i[log result agent_job job].freeze
 
-  helper :short_path do |path|
+  helper :short_path_from_path do |path|
     path = File.expand_path(path.to_s)
     home = File.expand_path('~')
     path.start_with?(home + '/') ? "~#{path[home.length..]}" : path
@@ -33,7 +33,7 @@ module ChatAnalyst
     return address unless Array === address && address.any?
     first = address.first
     rest = address[1..]
-    first.nil? ? rest : [short_path(first.to_s), *rest]
+    first.nil? ? rest : [short_path_from_path(first.to_s), *rest]
   end
 
   # Fine-grained provenance: parse `follow:` inputs ("all", "job,log", ...) into
@@ -149,7 +149,7 @@ module ChatAnalyst
     warning = {
       kind: entry[:kind] || kind,
       relation: entry[:relation] || relation,
-      path: short_path(path || source || (Hash === reference && reference[:source])),
+      path: short_path_from_path(path || source || (Hash === reference && reference[:source])),
       reason: entry[:reason] || (Hash === reference && reference[:reason]),
       call_id: entry[:call_id] || (Hash === reference && reference[:call_id]),
       tool_name: entry[:tool_name] || (Hash === reference && reference[:tool_name]),
@@ -219,21 +219,21 @@ module ChatAnalyst
         if Hash === detail
           sanitized = {
             relation: :agent_job,
-            from: short_path(Chat.provenance_path(edge[:from_kind], edge[:from])),
-            to: short_path(Chat.provenance_path(edge[:to_kind], edge[:to])),
+            from: short_path_from_path(Chat.provenance_path(edge[:from_kind], edge[:from])),
+            to: short_path_from_path(Chat.provenance_path(edge[:to_kind], edge[:to])),
             call_id: detail[:call_id],
             tool_name: detail[:tool_name],
             output_address: detail[:output_address] && short_address(detail[:output_address]),
             evidence_address: detail[:evidence_address] && short_address(detail[:evidence_address]),
-            job: detail[:job] && short_path(detail[:job])
+            job: detail[:job] && short_path_from_path(detail[:job])
           }.reject { |_key, value| value.nil? }
         end
         {
           from_kind: edge[:from_kind],
-          from: short_path(Chat.provenance_path(edge[:from_kind], edge[:from])),
+          from: short_path_from_path(Chat.provenance_path(edge[:from_kind], edge[:from])),
           relation: edge[:relation],
           to_kind: edge[:to_kind],
-          to: short_path(Chat.provenance_path(edge[:to_kind], edge[:to])),
+          to: short_path_from_path(Chat.provenance_path(edge[:to_kind], edge[:to])),
           detail: sanitized
         }
       end
@@ -251,7 +251,7 @@ module ChatAnalyst
 
       {
         root_kind: root_kind,
-        root: short_path(Chat.provenance_path(root_kind, root)),
+        root: short_path_from_path(Chat.provenance_path(root_kind, root)),
         chats: chats,
         jobs: jobs,
         edges: edges,
@@ -326,7 +326,7 @@ module ChatAnalyst
   # edges are the normalized provenance edges; job nodes are matched by their
   # short_path form.  Returns expanded chat paths as a Set.
   helper :delegated_subtree_chats do |edges, job_path|
-    target = short_path(job_path.to_s)
+    target = short_path_from_path(job_path.to_s)
     subtree_chats = Set.new
     visited = Set.new
     queue = [target]
@@ -448,7 +448,7 @@ module ChatAnalyst
   end
 
   helper :chat_tool_calls do |chat, path, events: []|
-    short = short_path(path)
+    short = short_path_from_path(path)
     receipt_warnings = []
     receipts = Chat.agent_meta_evidence(chat, source: path, warnings: receipt_warnings)
                     .group_by { |record| record[:call_id] }
@@ -484,7 +484,7 @@ module ChatAnalyst
                                          .collect { |event| event[:inference_id] }.compact.uniq,
           direct_token_total: sum_events(matched).slice(:pt, :ct, :tt),
           agent_job_references: records.select { |record| record[:meta][:job] }
-                                       .collect { |record| short_path(record[:meta][:job].to_s) }.uniq,
+                                       .collect { |record| short_path_from_path(record[:meta][:job].to_s) }.uniq,
           unresolved_receipts: direct.count { |record| !record[:meta][:inference_id] },
           warnings: (warning_by_call[call[:call_id]] || []).collect do |warning|
             {
@@ -518,7 +518,7 @@ module ChatAnalyst
       evidence: event[:evidence].collect do |item|
         record = {
           origin: item[:origin],
-          source: item[:source] && short_path(item[:source]),
+          source: item[:source] && short_path_from_path(item[:source]),
           call_id: item[:call_id],
           tool_name: item[:tool_name]
         }
@@ -544,7 +544,7 @@ module ChatAnalyst
     messages = provenance[:chats].flat_map do |path, chat|
       chat.message_index(source: path).filter_map do |info|
         next if role && !role.empty? && info[:role].to_s != role
-        path_str = short_path(path); index = info[:address].last
+        path_str = short_path_from_path(path); index = info[:address].last
         meta = info[:meta]
         if Hash === meta
           truncated_meta = {}
@@ -596,7 +596,7 @@ module ChatAnalyst
     end
 
     provenance_data(file, follow)[:chats].flat_map do |path, chat|
-      short = short_path(path)
+      short = short_path_from_path(path)
       chat.each_with_index.filter_map do |message, index|
         id = "#{short}##{index}"
         next unless wanted.include?(id) || wanted.include?("#{path}##{index}")
@@ -615,25 +615,25 @@ module ChatAnalyst
     chats = provenance[:chats].collect do |path, chat|
       receipts = Chat.agent_meta_evidence(chat, source: path)
       {
-        path: short_path(path),
+        path: short_path_from_path(path),
         messages: chat.length,
         roles: roles(chat),
-        direct_jobs: chat.jobs.collect { |job| short_path(job.to_s) },
+        direct_jobs: chat.jobs.collect { |job| short_path_from_path(job.to_s) },
         tool_calls: Chat.tool_calls(chat, source: path).length,
         receipt_records: receipts.length,
         receipt_job_references: receipts.select { |record| record[:meta][:job] }
-                                        .collect { |record| short_path(record[:meta][:job].to_s) }.uniq
+                                        .collect { |record| short_path_from_path(record[:meta][:job].to_s) }.uniq
       }
     end
     jobs = provenance[:jobs].collect do |path, job|
       {
-        path: short_path(path),
+        path: short_path_from_path(path),
         workflow: job.info[:workflow],
         task: job.info[:task_name],
         status: job.info[:status],
         dependencies: job.dependencies.length,
         direct_logs: provenance[:edges].count do |edge|
-          edge[:from_kind] == :job && edge[:from] == short_path(path) && edge[:relation] == :log
+          edge[:from_kind] == :job && edge[:from] == short_path_from_path(path) && edge[:relation] == :log
         end
       }
     end
@@ -749,7 +749,7 @@ module ChatAnalyst
     interactions = provenance[:chats].flat_map do |path, chat|
       calls = chat_tool_calls(chat, path, events: events)
       calls.select { |call| call[:agent_interaction] }.collect do |call|
-        call_path = short_path(path)
+        call_path = short_path_from_path(path)
         receipt = call[:agent_meta]
 
         # Association comes exclusively from agent_job edge details; paths and
@@ -855,9 +855,9 @@ module ChatAnalyst
         record = {
           origin: evidence[:origin],
           meta: rendered,
-          source: short_path(path),
+          source: short_path_from_path(path),
           classification: classification,
-          job: meta[:job] && short_path(meta[:job].to_s),
+          job: meta[:job] && short_path_from_path(meta[:job].to_s),
           inference_id: meta[:inference_id],
           provider_response_id: meta[:provider_response_id]
         }
@@ -906,7 +906,7 @@ module ChatAnalyst
     wanted = addresses && !addresses.empty? ? addresses.collect(&:to_s) : nil
 
     items = provenance[:chats].flat_map do |path, chat|
-      short = short_path(path)
+      short = short_path_from_path(path)
       Chat.meta_evidence(chat, source: path).filter_map do |evidence|
         reasoning = evidence[:meta][:reas]
         next unless String === reasoning && !reasoning.empty?
@@ -993,11 +993,11 @@ module ChatAnalyst
     # disjoint from delegated_tokens and the three-way split still reconciles.
     root_chat_paths = Set[File.expand_path(provenance[:root].to_s)]
     if provenance[:root_kind] == :job
-      root_job = provenance[:jobs].keys.find { |key| short_path(key) == provenance[:root].to_s }
+      root_job = provenance[:jobs].keys.find { |key| short_path_from_path(key) == provenance[:root].to_s }
       root_job ||= provenance[:jobs].keys.first
       if root_job
         root_chat_paths += provenance[:edges].select do |edge|
-          edge[:from] == short_path(root_job) && %i[log result].include?(edge[:relation]) &&
+          edge[:from] == short_path_from_path(root_job) && %i[log result].include?(edge[:relation]) &&
             edge[:to_kind] == :chat
         end.collect { |edge| File.expand_path(edge[:to].to_s) }
       end
@@ -1008,7 +1008,7 @@ module ChatAnalyst
     subtree_rows = linked_jobs.collect do |job|
       chats = delegated_subtree_chats(edges, job)
       tokens, count = delegated_events(events, chats)
-      { job: job, tokens: tokens, events: count, chats: chats.collect { |c| short_path(c) } }
+      { job: job, tokens: tokens, events: count, chats: chats.collect { |c| short_path_from_path(c) } }
     end
     delegated_union = linked_jobs.each_with_object(Set.new) { |job, union| union.merge(delegated_subtree_chats(edges, job)) }
     delegated_tokens, delegated_count = delegated_events(events, delegated_union)
@@ -1072,7 +1072,7 @@ module ChatAnalyst
 
     path = File.expand_path(root.to_s)
     references = chat_relationship_references(path).collect do |relationship|
-      relationship[:target] &&= short_path(relationship[:target])
+      relationship[:target] &&= short_path_from_path(relationship[:target])
       relationship
     end
 
@@ -1085,15 +1085,15 @@ module ChatAnalyst
         resolved: group.first[:resolved],
         types: group.collect { |relationship| relationship[:type] }.tally,
         references: group.length,
-        imported_by: short_path(path)
+        imported_by: short_path_from_path(path)
       }
     end
 
     {
-      source: short_path(path),
+      source: short_path_from_path(path),
       references: references,
       targets: targets,
-      import_closure: import_closure(path).collect { |chat| short_path(chat) },
+      import_closure: import_closure(path).collect { |chat| short_path_from_path(chat) },
       note: 'import/continue/last references are not part of core provenance traversal; they are recovered from the uncompiled chat text and resolved with Chat.find_file'
     }
   end
@@ -1135,10 +1135,10 @@ module ChatAnalyst
       imports = chat_relationship_references(chat).select { |relationship| relationship[:type] == :import }
       {
         scope: :own,
-        chat: short_path(chat),
+        chat: short_path_from_path(chat),
         imports: imports.collect { |relationship|
           target = relationship[:target] || relationship[:reference]
-          target && short_path(target)
+          target && short_path_from_path(target)
         }.compact,
         unresolved_imports: imports.reject { |relationship| relationship[:resolved] }
                                    .collect { |relationship| relationship[:reference] },
@@ -1153,7 +1153,7 @@ module ChatAnalyst
         direct_events: direct_count,
         delegated_tokens: delegated_tokens,
         delegated_events: delegated_count,
-        delegated_subtrees: own_linked_jobs.collect { |job| short_path(job) },
+        delegated_subtrees: own_linked_jobs.collect { |job| short_path_from_path(job) },
         warnings: own[:warnings].length
       }
     end
@@ -1172,20 +1172,20 @@ module ChatAnalyst
 
       entries = [{
         scope: :closure,
-        chat: short_path(path),
-        chats: closure.collect { |chat| short_path(chat) },
+        chat: short_path_from_path(path),
+        chats: closure.collect { |chat| short_path_from_path(chat) },
         tokens: totals[:deduplicated_total],
         token_events: deduplicated.length,
         conflicts: deduplicated.count { |event| event[:conflict] },
         incomplete_evidence: deduplicated.count { |event| event[:incomplete_evidence] },
-        token_events_per_chat: closure.to_h { |chat| [short_path(chat), provenance_data(chat, follow)[:events].length] }
+        token_events_per_chat: closure.to_h { |chat| [short_path_from_path(chat), provenance_data(chat, follow)[:events].length] }
       }]
     end
 
     {
-      source: short_path(path),
+      source: short_path_from_path(path),
       scope: scope.to_sym,
-      closure: closure.collect { |chat| short_path(chat) },
+      closure: closure.collect { |chat| short_path_from_path(chat) },
       entries: entries,
       note: 'own scope: each chat is accounted from its own file with its own job/log provenance; imported chats never contribute to another entry. closure scope merges all events with inference_id deduplication. tokens includes delegated subtrees when follow includes agent_job; direct_tokens + delegated_tokens may overlap it only via shared chats, otherwise they partition it.'
     }
@@ -1199,7 +1199,7 @@ module ChatAnalyst
   helper :live_chat_entry do |path, reference_time, likely_active: false|
     mtime = File.mtime(path)
     {
-      path: short_path(path),
+      path: short_path_from_path(path),
       mtime: mtime.iso8601,
       age: (reference_time - mtime).round(3),
       size: File.size(path),
@@ -1347,7 +1347,7 @@ module ChatAnalyst
     entries.concat(in_flight.filter_map do |entry|
                      begin
                        live_chat_entry(entry[:path], reference)
-                         .merge(source: :jobs, jobs_file: short_path(entry[:jobs_file]))
+                         .merge(source: :jobs, jobs_file: short_path_from_path(entry[:jobs_file]))
                      rescue StandardError
                        # the chat vanished while being read: the delegated
                        # job finished and cleaned up; report nothing for it
@@ -1358,7 +1358,7 @@ module ChatAnalyst
     entries.first[:likely_active] = true unless entries.empty?
 
     {
-      root: short_path(Chat.provenance_path(root_kind, root)),
+      root: short_path_from_path(Chat.provenance_path(root_kind, root)),
       root_kind: root_kind,
       chats: entries,
       total: entries.length,
@@ -1417,10 +1417,10 @@ module ChatAnalyst
     delivered = describe_inbox_files.call(removed_dir)
 
     {
-      save_file: short_path(save_file),
-      files_dir: short_path(files_dir),
-      inbox_dir: short_path(inbox_dir),
-      inbox_removed_dir: short_path(removed_dir),
+      save_file: short_path_from_path(save_file),
+      files_dir: short_path_from_path(files_dir),
+      inbox_dir: short_path_from_path(inbox_dir),
+      inbox_removed_dir: short_path_from_path(removed_dir),
       pending: pending,
       delivered: delivered
     }
@@ -1458,10 +1458,10 @@ module ChatAnalyst
     Open.write(target, message)
 
     {
-      posted: short_path(target),
+      posted: short_path_from_path(target),
       name: name,
-      save_file: short_path(save_file),
-      inbox_dir: short_path(inbox_dir),
+      save_file: short_path_from_path(save_file),
+      inbox_dir: short_path_from_path(inbox_dir),
       size: File.size(target),
       note: 'delivered as a user message on the next real inference; consume-once; the moved file in inbox_removed/ is the delivery record'
     }
