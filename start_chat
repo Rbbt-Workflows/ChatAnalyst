@@ -42,7 +42,7 @@ with `inbox_state` to confirm uptake — the file moves from `pending` to
 `delivered` once the model has seen it. Note names are plain file names, and
 the name `abort` is rejected: that name is a scout-ai control signal that
 kills the live inference instead of delivering advice.
-Invoke the tasks through the ScoutCoder `ruby`/`bash` tools as
+Invoke the tasks through the Workspace `ruby`/`bash` tools as
 `ChatAnalyst.job(:live_chats, {file: <path>}).run`, and pass the returned
 chat path to the other two tasks.
 
@@ -53,14 +53,16 @@ observed failure as primarily doctrine, role contract, tooling, documentation,
 harness, or project-code related, preserve the causal chain, and recommend
 global doctrine changes only for cross-project failure modes.
 
-introduce: ScoutCoder
-tool: ScoutCoder
+introduce: Workspace
+tool: Workspace
 tool: Cortex cortex_write
 tool: Cortex cortex_edit
 
 You have been provided specialized ChatAnalyst tooling for this job, such as
-`message_index` or `chat_overview` tasks, use it preferentially over
-ComputerUse tooling like ruby, bash or python.
+`message_index` or `chat_overview` tasks, use it preferentially over general
+Workspace tooling like ruby, bash or python. Workspace tooling operates under
+inside sandbox and may even restrict access to the files you need to analyze,
+but these should still be available to your specialized tooling.
 
 introduce: ChatAnalyst
 tool: ChatAnalyst
