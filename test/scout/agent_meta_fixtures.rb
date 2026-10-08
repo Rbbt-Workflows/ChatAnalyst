@@ -17,12 +17,16 @@ module ChatAnalystFixtures
     path
   end
 
+  # Receipt entries are the deserialized field hashes the scout-ai 2.1.0
+  # writer itself emits (LLM.meta_receipt_from_messages): no role/content
+  # wrapper, numeric fields already cast.  Built through the gem helper so
+  # fixture receipts match production receipts by construction.
   def meta_receipt(content)
-    {role: 'meta', content: content}
+    LLM.meta_receipt_from_messages([{role: 'meta', content: content}]).first
   end
 
   def receipt_output(call_id, agent_meta, name: 'ask', content: 'child answer')
-    {name: name, content: content, id: call_id, agent_meta: agent_meta}.to_json
+    {name: name, content: content, id: call_id, meta: agent_meta}.to_json
   end
 
   # Persisted chat text with one paired agent-oriented call per receipt entry.
@@ -54,7 +58,7 @@ module ChatAnalystFixtures
     File.write(path, result)
     File.write(path + '.info', {dependencies: dependencies}.to_json) if dependencies.any?
     logs.each do |name, text|
-      log_path = File.join(path + '.files', 'log', name)
+      log_path = File.join(path + '.files', name)
       FileUtils.mkdir_p(File.dirname(log_path))
       File.write(log_path, text)
     end
@@ -80,7 +84,7 @@ module ChatAnalystFixtures
     parent = File.join(dir, 'parent.chat')
     File.write(parent, "user: go\n" +
       'function_call: ' + %({"name":"cortex_continue","arguments":{"agent":"Worker","conversation":"c1"},"id":"a1"}) + "\n" +
-      'function_call_output: ' + %({"name":"cortex_continue","content":"delegated answer","id":"a1","agent_meta":[{"role":"meta","content":"job=#{worker}"}]}) + "\n" +
+      'function_call_output: ' + %({"name":"cortex_continue","content":"delegated answer","id":"a1","meta":#{[meta_receipt("job=#{worker}")].to_json}}) + "\n" +
       "meta: pt=3 ct=2 tt=6 inference_id=p1\n" +
       "assistant: done\n")
     [parent, worker]

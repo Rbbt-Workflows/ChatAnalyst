@@ -13,7 +13,7 @@ module ChatAnalystFixtures
     parent = File.join(dir, 'parent_missing.chat')
     File.write(parent, "user: go\n" +
       'function_call: ' + %({"name":"cortex_continue","arguments":{"agent":"Worker","conversation":"c1"},"id":"x1"}) + "\n" +
-      'function_call_output: ' + %({"name":"cortex_continue","content":"child answer","id":"x1","agent_meta":[{"role":"meta","content":"job=#{ghost}"}]}) + "\n" +
+      'function_call_output: ' + %({"name":"cortex_continue","content":"child answer","id":"x1","meta":#{[meta_receipt("job=#{ghost}")].to_json}}) + "\n" +
       "meta: pt=4 ct=2 tt=6 inference_id=p1\n" +
       "assistant: done\n")
     [parent, ghost]

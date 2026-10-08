@@ -3,6 +3,8 @@ require 'json'
 require 'set'
 require 'digest'
 
+Misc.add_libdir if __FILE__ == $PROGRAM_NAME
+
 module ChatAnalyst
   extend Workflow
   self.name = 'ChatAnalyst'
@@ -19,6 +21,14 @@ module ChatAnalyst
   # logs, results, further delegations, and nested jobs, but never
   # :dependency, which would attribute upstream jobs to the delegation.
   DELEGATION_SUBTREE_RELATIONS = %i[log result agent_job job].freeze
+
+  # A message longer than this (in characters) is reported as `large: true` by
+  # message_index: retrieving its full inline content (message_content) is
+  # usually wasteful at this size, so the flag marks candidates for ranged
+  # inspection (extract_chat_range) instead of full retrieval. The motivating
+  # incident was a 582k-character message, so the threshold sits an order of
+  # magnitude below it.
+  LARGE_MESSAGE_CHARACTERS = 100_000
 
   helper :short_path_from_path do |path|
     path = File.expand_path(path.to_s)
@@ -553,6 +563,13 @@ module ChatAnalyst
           end
           meta = truncated_meta
         end
+        # Size fields: scout-ai's message_index does not report content
+        # length, so it is computed here from the message itself. The keys are
+        # always present (nil content counts as 0) so consumers can rely on
+        # the shape; `large` flags messages whose full inline retrieval
+        # (message_content) would be wasteful at LARGE_MESSAGE_CHARACTERS.
+        message = chat[info[:address].last]
+        characters = (message[:content] || '').length
         {
           address: "#{path_str}##{index}",
           id: "#{path_str}##{index}",
@@ -560,6 +577,8 @@ module ChatAnalyst
           previous_lineage_id: info[:prev],
           role: info[:role],
           fingerprint: info[:fingerprint],
+          characters: characters,
+          large: characters > LARGE_MESSAGE_CHARACTERS,
           meta: meta
         }
       end
@@ -574,8 +593,16 @@ module ChatAnalyst
   input :start, :integer, 'Zero-based first message (inclusive)', 0
   input :end, :integer, 'Zero-based last message (inclusive)', nil, required: true
   task :extract_chat_range => :chat do |file, start, ending|
-    raise ParameterException, "Chat file not found: #{file}" unless File.file?(file.to_s)
-    chat = Chat.load(file.to_s)
+    # P0 path normalization: message_index/chat_tool_calls addresses carry
+    # ~-relative short paths (short_path_from_path), and bare chat names are
+    # resolvable through Scout.chats, so file resolution goes through the one
+    # shared candidate chain (resolve_root) instead of a bare File.file? test.
+    # Job roots are rejected: this task stays chat-file-only, mirroring the
+    # root-kind guards of provenance_relationships/inbox_state/post_inbox_advice.
+    root_kind, root = resolve_root(file)
+    raise ParameterException, 'extract_chat_range requires a chat file root; pass the chat path directly' unless root_kind == :chat
+
+    chat = Chat.load(root.to_s)
     raise ParameterException, 'start must be non-negative' if start < 0
     raise ParameterException, 'end must be greater than or equal to start' if ending < start
     raise ParameterException, "Message range #{start}..#{ending} is outside chat (#{chat.length} messages)" if ending >= chat.length
@@ -668,24 +695,47 @@ module ChatAnalyst
   input :page, :integer, 'Page number (1-based); enables pagination when set', nil, nofile: true
   input :per_page, :integer, 'Items per page (default 50 when page is set)', nil, nofile: true
   input :dedupe, :boolean, 'Mark socialized/log copies of the same logical call; summary counts stay raw', false, nofile: true
+  input :tool, :string, 'Exact tool-name filter for the call list; summary counts stay raw', nil, nofile: true
+  input :agent, :string, 'Exact target-agent filter for the call list; summary counts stay raw', nil, nofile: true
+  input :conversation, :string, 'Exact conversation filter for the call list; summary counts stay raw', nil, nofile: true
+  input :chat, :string, 'Exact chat path filter (path part of the call address); summary counts stay raw', nil, nofile: true
+  input :success, :boolean, 'Success-state filter for the call list (true/false); summary counts stay raw', nil, nofile: true
   desc 'Compact tool-call index with addresses and delegated receipt summaries.'
-  task :chat_tool_calls => :json do |file, follow, page, per_page, dedupe|
+  task :chat_tool_calls => :json do |file, follow, page, per_page, dedupe, tool, agent, conversation, chat, success|
     provenance = provenance_data(file, follow)
-    calls = provenance[:chats].flat_map do |path, chat|
-      chat_tool_calls(chat, path, events: provenance[:events])
+    calls = provenance[:chats].flat_map do |path, chat_path|
+      chat_tool_calls(chat_path, path, events: provenance[:events])
     end
     calls, unique_calls = dedupe ? mark_call_copies(calls) : [calls, nil]
 
+    # Summary counts are computed FIRST, over the whole session, and stay raw
+    # — mirroring the dedupe convention. The filters below then narrow only
+    # the MAIN `calls` list. All string filters are exact matches: `chat` is
+    # compared against the path part of the call address (the same short form
+    # the address carries). A call missing a filtered field never matches
+    # (so `agent` only selects calls carrying a target_agent); `success`
+    # compares the tri-state success flag directly. page/per_page apply after
+    # filtering, to the filtered list.
     result = {
       total: calls.length,
       successes: calls.count { |call| call[:success] == true },
       failures: calls.count { |call| call[:success] == false },
       incomplete: calls.count { |call| call[:success].nil? },
       copies: calls.count { |call| call[:copy_of] },
-      by_tool: calls.group_by { |call| call[:tool] || '(unknown)' }.transform_values(&:length),
-      calls: calls
+      by_tool: calls.group_by { |call| call[:tool] || '(unknown)' }.transform_values(&:length)
     }
     result[:unique_calls] = unique_calls if unique_calls
+
+    if tool || agent || conversation || chat || !success.nil?
+      calls = calls.select do |call|
+        (tool.nil? || call[:tool] == tool) &&
+          (agent.nil? || call[:target_agent] == agent) &&
+          (conversation.nil? || call[:conversation] == conversation) &&
+          (chat.nil? || call[:call_address].to_s.split('#', 2).first == chat) &&
+          (success.nil? || call[:success] == success)
+      end
+    end
+    result[:calls] = calls
 
     envelope = paginate_items(calls, page, per_page)
     next envelope.merge(calls: envelope.delete(:items), **result.except(:calls)) if envelope
@@ -1475,3 +1525,7 @@ module ChatAnalyst
 
   export :extract_chat_range
 end
+
+require 'ChatAnalyst/tasks/timeline'
+
+

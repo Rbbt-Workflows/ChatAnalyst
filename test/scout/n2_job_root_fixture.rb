@@ -12,7 +12,7 @@ module ChatAnalystFixtures
     root = File.join(dir, 'Root/ask/Default_r.chat')
     agent_chat = "user: root work\n" +
       'function_call: ' + %({"name":"cortex_continue","arguments":{"agent":"Worker","conversation":"k"},"id":"r1"}) + "\n" +
-      'function_call_output: ' + %({"name":"cortex_continue","content":"ok","id":"r1","agent_meta":[{"role":"meta","content":"job=#{File.join(dir, 'Worker/ask/Default_w')}"}]}) + "\n" +
+      'function_call_output: ' + %({"name":"cortex_continue","content":"ok","id":"r1","meta":#{[meta_receipt("job=#{File.join(dir, 'Worker/ask/Default_w')}")].to_json}}) + "\n" +
       "meta: pt=40 ct=20 tt=60 inference_id=r1\n" +
       "assistant: root done\n"
     FileUtils.mkdir_p(root + '.files')

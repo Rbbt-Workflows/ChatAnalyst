@@ -167,7 +167,16 @@ Return a compact index of every discovered message
 The task traverses the whole session from the root chat and indexes every
 persisted message in every discovered chat. Each entry carries a flat string
 address (`"path#index"`), the message lineage ID and its previous lineage ID,
-role, fingerprint, and truncated parsed metadata.
+role, fingerprint, character count, and truncated parsed metadata.
+
+Two size fields report how big a message is without retrieving it:
+`characters` (integer length of the message content; always present, `0` for
+messages with no content such as `meta` entries) and `large` (boolean, true
+when `characters` exceeds `LARGE_MESSAGE_CHARACTERS`, 100000). Scout-ai's own
+message index does not report content length, so the count is computed here
+from the persisted message. Treat `large: true` as a hint to inspect the
+message by range (`extract_chat_range`) rather than fetching all of it inline
+with `message_content`.
 
 Use it first to see the size and shape of a session, or to obtain the addresses
 that `message_content` can retrieve. The `role` input selects one role, and the
@@ -232,6 +241,19 @@ arguments — so with `dedupe: true` every later copy is marked with `copy_of`
 (the address of its first occurrence) and the result reports `copies` and
 `unique_calls` alongside the raw `total`, which keeps counting every evidence
 copy.
+
+The filter inputs narrow the call list itself: `tool` (tool name), `agent`
+(target agent), `conversation` (conversation name), `chat` (path part of the
+call address, the same short form the address carries), and `success`
+(`true`/`false` success state). All filters use **exact** equality — substring
+matching is deliberately not performed, so filter values must match the
+emitted field verbatim. A call missing a filtered field never matches, which
+also means `agent` only selects calls that carry a `target_agent`. Filtering
+follows the same convention as `dedupe`: the summary counts (`total`,
+`successes`, `failures`, `by_tool`, ...) are computed before filtering and
+stay raw, so they always describe the whole session while the `calls` list
+describes the filtered selection. `page`/`per_page` paginate the filtered
+list.
 
 ## chat_tokens
 Deduplicated direct inference token usage with evidence locations

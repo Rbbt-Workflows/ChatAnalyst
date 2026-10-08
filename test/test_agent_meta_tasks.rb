@@ -18,8 +18,11 @@ class TestAgentMetaTasks < Test::Unit::TestCase
       detail = agent_edges.first[:detail]
       assert_equal 'a1', detail[:call_id]
       assert_equal 'ask', detail[:tool_name]
-      assert detail[:evidence_address].include?(:agent_meta) ||
-             detail[:evidence_address].include?('agent_meta')
+      # scout-ai 2.1.0 tags receipt evidence addresses with :meta (the
+      # envelope key), so the address embeds the format tag, not the
+      # :agent_meta origin label.
+      assert detail[:evidence_address].include?(:meta) ||
+             detail[:evidence_address].include?('meta')
       chat = result[:chats].find { |c| c[:path] =~ /parent\.chat/ }
       assert chat[:receipt_records] >= 1
       assert result[:totals][:agent_job_edges] >= 1
