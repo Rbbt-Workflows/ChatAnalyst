@@ -22,6 +22,8 @@ ChatAnalyst=/$PWD filter="*" {
 
   improvements
 
+  timeline
+
  }
  lib=lib{
   ChatAnalyst=ChatAnalyst{
@@ -31,21 +33,8 @@ ChatAnalyst=/$PWD filter="*" {
   }
  }
  test=test{
-  test_agent_meta_tasks.rb
-  test_cross_consumer_tokens.rb
-  test_extract_chat_range.rb
-  test_helper.rb
-  test_inbox_tasks.rb
-  test_job_reference_fallback.rb
-  test_job_root_own_chats.rb
-  test_message_sizes_and_call_filters.rb
-  test_pagination_and_copies.rb
-  test_provenance_relationships.rb
-  test_unresolved_jobs_nil.rb
   scout=scout{
    agent_meta_fixtures.rb
-   n1_malformed_fixture.rb
-   n2_job_root_fixture.rb
   }
  }
  tmp=tmp {
