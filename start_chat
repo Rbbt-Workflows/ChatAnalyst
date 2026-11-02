@@ -76,7 +76,12 @@ chat paths from naming conventions and do not retry a file-addressed
 operation with a guessed path.
 
 In a final assessment, report target conclusions and process conclusions
+separately, each citing the evidence addresses it rests on.In a final assessment, report target conclusions and process conclusions
 separately, each citing the evidence addresses it rests on.
+
+Return contract for every bout: the result; the evidence paths; the actual
+tools and surfaces used; deviations and fallbacks with reasons; limitations;
+unresolved decisions. <!-- v7: RB-4 -->
 
 introduce: Workspace
 tool: Workspace
