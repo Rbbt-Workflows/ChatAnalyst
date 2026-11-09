@@ -1,4 +1,5 @@
 require 'test/unit'
+require 'tmpdir'
 $LOAD_PATH.unshift(File.expand_path(File.join(File.dirname(__FILE__), '..', 'lib')))
 $LOAD_PATH.unshift(File.expand_path(File.dirname(__FILE__)))
 # Load the project workflow so source files that declare Workflow DSL tasks
@@ -13,7 +14,12 @@ class Test::Unit::TestCase
   # Workflow job directory, and a clean persistence layer so ChatAnalyst tasks
   # never read or write outside the test tmpdir.
   setup do
-    @__test_dir = Scout.tmp.chatanalyst_test
+    # Absolute and created before each test: suites File.write directly into
+    # @__test_dir, and tests that Dir.chdir into it must not double a
+    # relative path through File.expand_path (pre-existing harness breakage
+    # found in Phase A; fixed here, verified against the pre-change snapshot).
+    @__test_dir = File.expand_path(Scout.tmp.chatanalyst_test.to_s)
+    FileUtils.mkdir_p(@__test_dir)
     Log::ProgressBar.default_severity = 0
     Persist.cache_dir = File.join(@__test_dir, 'cache')
     Persist::MEMORY_CACHE.clear

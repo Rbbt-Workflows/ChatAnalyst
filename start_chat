@@ -45,7 +45,50 @@ tool: Workspace
 tool: Cortex cortex_write
 tool: Cortex cortex_edit
 
-You have been provided specialized ChatAnalyst tooling for this job, with tools such as `message_index`, `message_content`, `chat_agents`, `chat_overview`, etc.; use this tooling instead general Workspace tooling like bash, python or ruby when reading conversation logs in Chat format. Resorting to using tools like read or bash over chat logs is considered a deviation justified by shortcomings of the ChatAnalyst tooling. Please report those if they can lead to tooling improvements.
+You have been provided specialized ChatAnalyst tooling for this job; use this tooling instead of general Workspace tooling like bash, python or ruby when reading conversation logs in Chat format. Resorting to using tools like read or bash over chat logs is considered a deviation justified by shortcomings of the ChatAnalyst tooling. Please report those if they can lead to tooling improvements.
+
+The exported task family (post phase-2 revision; see the ChatAnalyst README
+for exact shapes).  Retrieval ladder: start at the tree overview, narrow to
+timeline bursts or token scopes, drill into tool calls or messages, fetch raw
+text last:
+
+- `chat_overview` — tree overview: chats with message/role counts and
+  job/delegation references keyed by originating message index, jobs with
+  direct dependencies; `unloaded_references` entries carry `{kind, path,
+  error, via}` (via = the originating reference).
+- `chat_timeline` — bouts + temporal bursts.  Two modes: default returns the
+  compact bout list; passing `bursts` ids selects bursts whose bouts are
+  inlined, and the root bout list is then omitted (`bouts_total` reports its
+  size).
+- `chat_tokens` — deduplicated token scopes, conflicts, evidence; pass
+  `attribution: true` to attach the attribution view (root/delegated/
+  unattributed split, linked_jobs, unresolved_jobs).
+- `chat_tool_calls` — structured tree-wide call index: each record is a chat
+  path + `call_index` integer + size fields — no `"path#index"` strings.
+- `chat_tool_call` — full evidence for ONE call: arguments, persisted output
+  content, status/reason/error, delegation, jobs.
+- `chat_messages` — zero-based index of ONE chat, no bodies; role filter,
+  pagination and a `large` flag.
+- `chat_range` — inclusive message range of one chat; cap 200 messages per
+  request; `first == last` fetches one message; `raw: true` returns the exact
+  persisted `.chat` text of the slice (byte-exact) alongside the structured
+  messages.
+- `chat_accounting` — per-chat import-closure token accounting (own scope:
+  direct/delegated split per chat; closure scope: one merged root entry).
+- Operational: `live_chats`, `inbox_state`, `post_inbox_advice`.
+
+Notes: message indices are zero-based and ranges are inclusive; `characters`
+counts parsed message content, never file bytes; embedded `meta` receipts are
+evidence, not messages, so they never appear in message indexes — they are
+visible through `chat_tokens`/`chat_tokens attribution:true` evidence
+locations.  Every chat path every task returns is one canonical spelling
+(realpath'd when the file exists), so a path can be fed back into any task.
+Job receipts under `jobs`/`linked_jobs` and persisted job outputs are
+execution evidence: to establish what a referenced job actually produced,
+load its result chat (`chat_overview` lists the generated output chat) or the
+cited job directory — do not infer from the receipt alone.  Retired task
+names raise TaskNotFound; the README's "Retired adapters" section and
+`var/baselines/` record what replaced them.
 
 introduce: ChatAnalyst
 tool: ChatAnalyst

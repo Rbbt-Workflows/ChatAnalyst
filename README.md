@@ -1,53 +1,191 @@
-Inspect Scout-AI sessions, their lineage segments, producer jobs, agent logs, tool calls, and direct token usage without replaying them.
+Inspect Scout-AI sessions, their lineage segments, producer jobs, agent logs,
+tool calls, and direct token usage without replaying them.
 
-ChatAnalyst uses the shared `Chat.traverse_provenance` primitive. It reads persisted chats with `Chat.load` and traverses every job referenced by `meta job=...`. The workflow keeps report state in ordinary Hashes and Arrays; it does not define a Session or graph wrapper.
-For each job it follows persisted dependencies, chat results, and all
-the chats saved in the job's `.files` sidecar, under two coexisting layouts:
-the current layout writes the agent's full chat at
-`<job>.files/<name>.chat` (`agent.chat` by default, otherwise named after the
-agent, e.g. `worker.chat`) and every nested conversation under
-`<job>.files/<name>.society/**/*.chat`; the legacy
-`<job>.files/log/**/*.chat` layout (including the old `log/agent.chat` logs
-and the `log/chats/...` projections) is written by older scout-ai, read for
-compatibility, and never migrated.
+ChatAnalyst reads persisted chats with `Chat.load` and traverses job
+references through scout-ai's compact one-node provenance API
+`Chat.provenance_graph`. The workflow keeps report state in ordinary Hashes
+and Arrays; it does not define a Session or graph wrapper.
 
-Imported and continued chats are not part of core provenance; their content is
-already inlined in the persisted chat file during `Chat.parse`. To account for
-them anyway, `provenance_relationships` recovers `import:`, `continue:`, and
-`last:` references from the uncompiled chat text and resolves them with
+The exported interface is two-layered:
+
+- a **public Ruby API** — eleven plain module methods on `ChatAnalyst`
+  (`lib/ChatAnalyst/api.rb`: the nine redesigned methods plus `tool_call`
+  from phase 1 and `attribution` from phase 2) returning serializable
+  Hashes/Arrays of paths, zero-based integer indices and counts;
+- **thin workflow tasks** (`lib/ChatAnalyst/tasks/api_tasks.rb`) that wrap
+  the module methods with argument validation and serialization only.
+
+Method names (`ChatAnalyst.overview`) and task names
+(`ChatAnalyst.job(:chat_overview, …)`) are distinct surfaces: the method is
+the Ruby API; the task is the Scout workflow surface (CLI or agent tool).
+Tasks never re-implement provenance semantics; they call the module methods.
+
+## Vocabulary note: `meta`, not `agent_meta`
+
+Receipt records are read through the **`meta`** field of
+`function_call_output` envelopes. The legacy `agent_meta` key is no longer
+read by the core: the compact graph resolves receipts internally, and
+ChatAnalyst consumes `Chat.provenance_graph` / `Chat.provenance_token_events`,
+which return the resolved evidence (standalone `meta: job=` refs anchored at
+their own message index; receipt `job=` refs anchored at the outer
+`function_call_output` index). Embedded receipts are *evidence*, never
+messages of the parent chat, and are never listed by `ChatAnalyst.message_index`
+(the Ruby API method; the task adapter of the same name was retired in phase 2).
+
+## Addressing contract
+
+- Message indices are **zero-based** positions in the parsed message sequence
+  of one chat file; ranges (`chat_range`, `ChatAnalyst.range`) are inclusive
+  at both ends.
+- `characters` counts the characters of the **parsed message content** string;
+  it is never a file byte offset. Cumulative offsets are deliberately not
+  exposed (documented Phase A decision: exactly one coordinate system —
+  parse position — that cannot drift from `Chat.load`).
+- Paths in public results are canonical absolute paths, directly usable as
+  later inputs — ONE canonical spelling across every public operation
+  (overview, relationships, range, tool_calls; `Chat.provenance_path`
+  realpath with expand_path fallback), pinned against `/home/...` vs
+  `/bulk/...` alias mount spellings. The legacy `"path#index"` address
+  spelling is gone: no exported task concatenates it (the four adapters that
+  carried it were retired in phase 2).
+- No `Chat`/`Step`/`Path` instances and no synthetic ids (`c1`, `j1`) appear
+  in any public result.
+- There is **no `follow` input anywhere**: traversal always follows job
+  references and direct dependencies, and never follows delegation targets or
+  live sidecar chats. (Legacy `follow` was dropped in the Stage 0 decision
+  recorded in `research/stage0-notes.md`; zero consumers used it.)
+- ChatAnalyst never calls the retired materialized-graph collectors
+  (`provenance_closure` / `provenance_edges` / `provenance_chat_files` /
+  `provenance_jobs`); the old materialized reconstruction is gone.
+
+## Public Ruby API (`lib/ChatAnalyst/api.rb`)
+
+```ruby
+ChatAnalyst.overview(root, root_type: nil)
+ChatAnalyst.timeline(root, bursts: [], burst_gap: 120)
+ChatAnalyst.message_index(chat_path)          # one chat; no bodies
+ChatAnalyst.message(chat_path, index)         # full retrieval of one message
+ChatAnalyst.range(chat_path, first, last)     # inclusive range, one chat
+ChatAnalyst.tool_calls(chat_path, first: nil, last: nil)
+ChatAnalyst.tokens(root)
+ChatAnalyst.attribution(root)                 # root/delegated/unattributed split
+ChatAnalyst.relationships(chat_path)
+ChatAnalyst.live(root)
+```
+
+`root` is a chat file path or a job root (a persisted Step directory,
+detected by its `.info` sidecar); `root_type: :chat | :job` overrides the
+detection. Shapes:
+
+- **overview** — `{root: {type, path}, chats: [{path, messages, roles,
+  job_references (index→path|Array), delegation_references (index→
+  "Agent#conversation"), live, warnings}], jobs: [{path, dependencies
+  (declared order), live, warnings}], live_missing?, unloaded_references?}`.
+  Queue-based breadth-first traversal, one `provenance_graph` call per node;
+  chat/job identity stay distinct even when a chat-producing job and its
+  output chat share a path. A job node contributes ONLY its generated output
+  chat (`Chat.job_result_chat_file`); its input chat is invocation context
+  and is never read. Live sidecar paths are listed, never traversed.
+  `job_references`/`delegation_references`/`dependencies` are recursively
+  normalized to plain canonical Strings (hardening; pinned — no Pathname/Path
+  instances and no alias spellings). `unloaded_references` entries are
+  `{kind, path, error, via}` where `via` records the originating reference
+  `{from_kind, from_path, context}` (phase-2 enrichment; `via.context` is
+  the receipt or message context that produced the reference).
+- **timeline** — two modes. Default (no `bursts`): `{root, summary: {chats,
+  jobs, bouts, implicit_bouts, calls, delegations, bursts}, bouts: [...],
+  bursts: [...] (compact: id, chats, bout count, call counts),
+  live_missing?, unloaded_references?}`. Selection mode (`bursts:` given):
+  `{root, summary, selected_burst_ids, bursts: [selected bursts with their
+  bouts INLINED], live_missing?, unloaded_references?}` — and **no `:bouts`
+  key at all** (the selected bouts appear only inside their bursts; the
+  pre-phase-1 duplication — all bouts + selected bouts inlined again — is
+  gone, pinned by a regression test). Bouts are anchored by chat path +
+  first/last zero-based indices + timestamp (when present) + reasoning
+  character count + compact preview + tool-call positions. The persisted
+  planned interaction is the `user`/`meta`/`assistant` triplet with the
+  **`meta` message as the inference anchor**. Reasoning-only bouts are
+  preserved; implicit tool-call bouts (call+output without intervening
+  assistant reasoning) are labeled `implicit: true`. Bursts are TEMPORAL
+  groupings only (elapsed gap above `burst_gap` seconds); they carry no
+  semantic phase claims. Cross-chat references always stay chat path + that
+  chat's own indices — no
+  per-chat-restarting event numbering. Timestamps are parsed defensively:
+  unparseable values become nil and never abort the report.
+- **message_index / message / range** — Ruby API methods (the `message_index`
+  TASK was retired in phase 2; the method stays): indexing and retrieval for
+  one chat; useful errors name the chat path, the requested index and the
+  valid range; large messages are identified by `characters` alone
+  (`LARGE_MESSAGE_CHARACTERS` = 100000) and never inlined by the index.
+- **tool_calls** — `{chat, first?, last?, calls: [{tool, call_id, call_index,
+  output_index, timestamp?, status (:success/:failure/:error/:unknown),
+  output_characters, delegated, delegation_target?, jobs: [paths]}]}`.
+  Receipt-derived job references attach to the outer `function_call_output`
+  message index (the compact graph's `chats` mapping); ask calls use the
+  `delegation` mapping; an ask without a job reference is still a valid
+  delegation entry (`delegated: true, jobs: []`). Delegation target and
+  materialized job stay distinct: a job is never inferred from agent name,
+  society directory or path convention. Dedup identity: two calls classify as
+  copies only with sufficient identity evidence — identical tool + arguments
+  with a MISSING call id never auto-collapses two independent calls.
+  Arguments and outputs are not inlined.
+- **tokens** — `{root, scopes: {deduplicated_total, chat_evidence,
+  receipt_evidence, receipt_only}, conflicts: {events,
+  incomplete_evidence_events, authoritative}, events: [...], warnings}`.
+  Delegated wholesale to `Chat.provenance_token_events` and
+  `Chat.provenance_token_totals`: field semantics (pt/ct/tt/cct/cwt/rt),
+  canonical-evidence counting, identity/conflict rules and the checkpoint
+  exclusion of `*_c`/`*_s` all live in the core; no accounting is rebuilt
+  here. Scopes are EVIDENCE COVERAGE descriptions, never a partition of
+  cost: `chat_evidence` and `receipt_evidence` overlap and must not be
+  summed; only `deduplicated_total` and `receipt_only` compare additively.
+  A conflicting event is counted once from canonical evidence; a total
+  containing conflicts is best-effort (`conflicts.authoritative: false`).
+- **relationships** — `{chat, references: [{type (:import/:continue/:last),
+  message_index, target, resolved, unresolved_reason?}], targets,
+  import_closure}`. Import/continue/last references are inspected SEPARATELY
+  from core provenance (the core traversal deliberately ignores them);
+  `import_closure` is the post-order, cycle-safe walk over resolved `import:`
+  references only. Unresolved local references are reported
+  (`resolved: false, unresolved_reason: :missing`), never raised.
+- **live** — LIVE (in-flight) state for the tree rooted at `root`, delegated
+  to `Chat.live_report` over the root's save file; fail-soft throughout.
+  Entry kinds: `:inference`, `:workload_context`, `:agent_activity`,
+  `:dangling_job`; entries carry plain-string paths/references (the core's
+  transient `:step` objects are stripped).
+
+### Cache and freshness (timeline)
+
+Freshness identity comes from ONE traversal: digests over the root kind +
+canonical path, every visited chat file's content, every visited job's result
+and `.info` bytes, and the discovered live-path set. The in-process cache is
+keyed `[root_kind, canonical_path, burst_gap]`, LRU-bounded, and stores a
+deep copy of compact metadata only — never `Chat`/`Step` objects. Chat
+append, job result/metadata change, or live/relationship discovery all
+invalidate; the traversal runs on every call, so a new invocation always sees
+newly appended messages.
+
+## Import closure accounting
+
+Imported and continued chats are not part of core provenance; their content
+is already inlined in the persisted chat file during `Chat.parse`. To account
+for them anyway, `ChatAnalyst.relationships` recovers `import:`, `continue:`,
+and `last:` references from the uncompiled chat text and resolves them with
 `Chat.find_file`, and `chat_accounting` accounts each chat of the import
-closure separately from its own file.
+closure separately from its own file (`scope: own` / `scope: closure`).
 
-## Provenance traversal and import closure
+A meta message starts a response segment. The segment can contain several
+tool calls, tool outputs, and an assistant message. It ends at another meta,
+a new user/system turn, or the end of the chat. A meta with an empty segment
+is an orphan record for a removed response message.
 
-Two families of relationships are reported independently:
-
-- Core provenance (job, dependency, log, result, agent_job), traversed by
-  `Chat.traverse_provenance`. Every provenance task accepts a `follow` input
-  to restrict traversal to a subset of relations; the default remains `all`.
-- Chat-level references (`import:`, `continue:`, `last:`). They are invisible
-  to core traversal, so they are recovered as explicit relationship events
-  with position and resolved target, plus an import closure (post-order,
-  cycle-safe). A chain of progressive imports is therefore accounted per
-  chat: pass the root chat to `chat_accounting` with the default `scope:
-  own` and every imported chat appears as its own entry, with the shared
-  `closure` scope available for the merged total.
-
-A meta message starts a response segment. The segment can contain several tool
-calls, tool outputs, and an assistant message. It ends at another meta, a new
-user/system turn, or the end of the chat. A meta with an empty segment is an
-orphan record for a removed response message.
-
-Direct `pt`, `ct`, `cct`, `rt`, and `tt` metadata records one inference. New
-records carry an `inference_id`, which is used for exact deduplication; legacy
-records fall back to conversational lineage and are marked accordingly. `meta
-job=...` marks one response segment projected from an ask job and has no direct
-token cost. The job's logs and dependencies contain the actual inference
-metadata. Running `*_c` and `*_s` values are checkpoints and are not summed.
+Direct `pt`, `ct`, `cct`, `rt`, and `tt` metadata records one inference.
+Records carry an `inference_id`, used for exact deduplication. `meta job=...`
+marks one response segment projected from an ask job and has no direct token
+cost; the job's logs and dependencies contain the actual inference metadata.
+Running `*_c` and `*_s` values are checkpoints and are not summed.
 
 ## Token count categories
-
-These are typical token count categories. Not all are always available.
 
 - pt: prompt tokens
 - ct: completion tokens
@@ -56,451 +194,194 @@ These are typical token count categories. Not all are always available.
 - cwt: cache write tokens
 - rt: reasoning tokens
 
-When discussing tokens always consider that cache tokens are much less expensive in
-general (about 10% of the normal cost).
+When discussing tokens always consider that cache tokens are much less
+expensive in general (about 10% of the normal cost).
 
 ## Society chats and legacy socialized projections
 
-When a Manager or supervisor agent dispatches work to a specialist agent through
-the `ask` tool with a named `conversation`, the specialist interaction is
-persisted as a full chat of the society tree:
+When a Manager or supervisor agent dispatches work to a specialist agent
+through the `ask` tool with a named `conversation`, the specialist
+interaction is persisted as a full chat of the society tree:
 
 ```text
 <caller_job>.files/<name>.society/<AgentName>/<conversation>/agent.chat
 ```
 
-The `<name>` component names the caller's own log (`agent.society` by
-default, mirroring the agent's own log name, e.g. `worker.society`). These
-files are the agent's full chats, including the tool calls and the direct
-inference metadata of every model call, so they are counted directly by
-`chat_tokens` and appear like any other chat of the session.
-
-Older scout-ai wrote a different artifact for the same mechanism: a
-**legacy socialized projection** (read for compatibility, never migrated) at
-
-```text
-<caller_job>.files/log/chats/<AgentName>/<conversation_name>.chat
-```
-
-These files are **projections**, not full agent logs. They contain the prompt,
-propagated `option:` lines (including endpoint, model, backend, and potentially
-credentials), a `meta: job=<path>` marker, and the assistant response — but they
-carry **zero direct inference tokens**. The actual model calls and tool activity
-are found by following the `meta: job=...` reference to the specialist's ask-job
-and reading its `agent.chat` log and dependencies.
-
-When inspecting a session that uses socialized agents, the legacy projection
-files behave as follows (current society files behave like any other chat,
-with their own inferences and tokens):
-
-- Legacy projection files will appear in `chat_overview` with `tool_calls: N`
-  reflecting only the calls visible in the projected segment, not the full set
-  of calls in the underlying job.
-- Legacy projection files will show `inferences: 0` and zero tokens in
-  `chat_tokens` because they only carry a projection marker.
-- The `chat_overview` edges connect legacy projections to their producer jobs via
-  `result` edges and to the caller job via `log` edges.
-- To find the real token usage and full tool-call count, follow the
-  `meta: job=...` reference to the specialist's ask-job and inspect its
-  `agent.chat` log (or the equivalent top-level log in the layout that job
-  was saved with) and any nested dependencies (such as gather or
-  pre-processing jobs).
+These files are the agent's full chats, including the tool calls and the
+direct inference metadata of every model call, so they are counted directly
+by `chat_tokens` and appear like any other chat of the session. Older
+scout-ai wrote legacy socialized projections at
+`<caller_job>.files/log/chats/<AgentName>/<conversation_name>.chat`; they
+carry zero direct inference tokens and a `meta: job=<path>` marker — follow
+the reference to the specialist's ask-job for the real usage.
 
 Typical programmatic use:
 
-    report = ChatAnalyst.job(:chat_report,
-      file: '/path/to/session.chat').run
+    report = ChatAnalyst.tokens('/path/to/session.chat')
+    view   = ChatAnalyst.attribution('/path/to/session.chat')
 
 For command-line inspection of the same model, use:
 
     scout-ai llm prov /path/to/session.chat
 
-Since the scout-ai provenance revamp (commit 3a37b24), the default tree
-numbers every node with `evidence=`, a subtree-deduplicated closure of the
-direct inference events reachable from that node; these values overlap between
-siblings and ancestors and are never a per-part cost. Job nodes additionally
-carry `delta=`, the direct totals of the job's persisted chat-typed result
-(the accounting delta; deltas sum to the root total on continuation chains).
-Both modes end with a root footer `deduplicated_total=<tt> (<N> events) ...`,
-which is the one authoritative cost figure; with `--component` the per-node
-numbers are relabeled `direct=` (per-component direct tokens) while the
-footer stays authoritative.
-
-Note that these logs are written automatically when workflows `ask` tasks are
-used for inference and are defined using the function `chat_task` from the
-`AgentWorkflow` mixin, and that they save societies recursively. Without a
-surrounding `ask` `chat_task` these detailed logs will be lost, but agent
-receipts (`agent_meta`) will still be available, containing some auditable
-information.
-
-## Delegated agent receipts (`agent_meta`)
+## Delegated agent receipts (`meta`)
 
 When an agent requests help from another agent using `ask` (or a
-`hand_off_to_*` tool), the `function_call_output` envelope may include an
-`agent_meta` array carrying the delegated inference's meta records: direct
-token records and, when the child ran as a `chat_task`, a `job=` reference to
-the producing Step. These receipts make delegation auditable even when no
-child chat or job was saved.
+`hand_off_to_*` tool), the `function_call_output` envelope may include `meta`
+receipts carrying the delegated inference's meta records: direct token
+records and, when the child ran as a `chat_task`, a `job=` reference to the
+producing Step. These receipts make delegation auditable even when no child
+chat or job was saved. Receipt records are embedded evidence, never messages
+of the parent chat. Provenance traversal follows their `job=` references, and
+token accounting counts their direct events once, deduplicated by
+`inference_id` against any saved child log that carries the same event.
 
-Receipt records are *embedded evidence*, not messages of the parent chat, and
-are never added to the parent Chat Array. Provenance traversal follows their
-`job=` references as `agent_job` edges, and token accounting counts their
-direct events once, deduplicated by `inference_id` against any saved child log
-that carries the same event. A receipt copy and a saved child-log copy of the
-same event are two evidence locations for one paid inference; both stay
-visible, the cost is counted once. Legacy receipts without an `inference_id`
-are marked unresolved and may be over-counted when no child log exists.
+## Gem trap
+
+The installed scout-ai 2.0.0 gem predates the compact provenance API
+(`provenance_graph`, `live_report`, `provenance_token_events` etc.). Every
+test or programmatic run must resolve the checkout:
+
+    ruby -I/home/mvazque2/git/scout-ai/lib -Itest test/<file>.rb
+
+from the checkout root. The test helper asserts
+`Chat.respond_to?(:provenance_graph)` as a canary so gem shadowing fails
+loudly.
 
 # Tasks
 
-## extract_chat_range
-Extract an inclusive zero-based message range from one persisted `.chat` file.
-
-The required `file`, `start`, and `end` inputs are validated against messages
-parsed by `Chat.load`; selected messages are serialized with `Chat.print`,
-without agent inference or compilation. By default serialized `.chat` content
-is returned.
-
-## message_index
-Return a compact index of every discovered message
-
-The task traverses the whole session from the root chat and indexes every
-persisted message in every discovered chat. Each entry carries a flat string
-address (`"path#index"`), the message lineage ID and its previous lineage ID,
-role, fingerprint, character count, and truncated parsed metadata.
-
-Two size fields report how big a message is without retrieving it:
-`characters` (integer length of the message content; always present, `0` for
-messages with no content such as `meta` entries) and `large` (boolean, true
-when `characters` exceeds `LARGE_MESSAGE_CHARACTERS`, 100000). Scout-ai's own
-message index does not report content length, so the count is computed here
-from the persisted message. Treat `large: true` as a hint to inspect the
-message by range (`extract_chat_range`) rather than fetching all of it inline
-with `message_content`.
-
-Use it first to see the size and shape of a session, or to obtain the addresses
-that `message_content` can retrieve. The `role` input selects one role, and the
-`page`/`per_page` inputs return a paginated envelope (`messages` plus
-`page`, `per_page`, `total`, `total_pages`, `next_page`, `prev_page`) when the
-index is too large for one response.
-
-Embedded `agent_meta` receipts are **not** messages of the parent chat and are
-therefore never listed here; use `meta_evidence` for those.
-The `page`/`per_page` inputs paginate the message list without touching any
-other field: totals and counts always cover the full session.
-
-## message_content
-Retrieve full content for selected indexed messages
-
-Pass flat string IDs (`"path#index"`) returned by `message_index` or
-`chat_tool_calls`. The task returns the persisted role and untruncated content
-without compiling or executing the chat. It resolves real persisted message
-addresses only; receipt evidence addresses belong to `meta_evidence` and
-`chat_reasoning`.
+Eight analytic tasks (thin adapters over the module methods: argument
+validation + serialization only) plus three operational tasks. The four
+Phase C legacy adapters were retired in phase 2 (see "Retired adapters").
 
 ## chat_overview
-Summarize discovered chats, jobs, and typed provenance relations
+Compact overview of the provenance tree.
 
-The structural map of a session: one record per discovered chat (messages,
-roles, visible `job=` references, tool-call count, receipt record count) and
-per discovered job (workflow, task, status, dependency count, log count),
-together with the typed edges between them (`job`, `dependency`, `log`,
-`result`, `agent_job`) and aggregate counts.
+Thin task over `ChatAnalyst.overview`. Inputs: `file` (root chat or job),
+`root_type`. Chats with message/role counts and job/delegation references
+keyed by originating message index; jobs with direct dependencies. Absolute
+canonical paths (one spelling across every task), zero-based indices, no
+bodies; `unloaded_references` entries carry `{kind, path, error, via}`.
 
-`agent_job` edges are produced by delegated receipts: their `detail` carries
-the call ID, tool name, output address, and receipt evidence address that
-produced the link. The `totals` block also reports receipt-only events,
-identity conflicts, and incomplete-evidence events. `warnings` lists malformed
-receipts and provenance problems. Start here when orienting in an unknown
-session; use `chat_tokens` for costs and `chat_agents` for delegation.
+## chat_timeline
+Timeline of persisted interaction bouts.
 
-The `follow` input restricts traversal to a subset of core relations (for
-example `job,log`); the default `all` keeps the previous behavior.
+Thin task over `ChatAnalyst.timeline`. Inputs: `file`, `bursts` (ids whose
+bouts are inlined as detail), `burst_gap` (seconds, default 120). Bursts are
+temporal groupings only (elapsed-gap), never semantic phases.
 
-## chat_tool_calls
-Compact index of function calls with retrievable addresses
+## chat_messages
+Zero-based index of every message in one chat: role, character count,
+`large` flag, timestamp when present. Never bodies. Inputs: `file` (chat
+file), `role` (filter), `page`, `per_page` (pagination envelope; filters and
+paging narrow the list only). Carries the retired `message_index`
+capabilities (role filter, pagination, large-message flag).
 
-The task pairs `function_call`/`mcp_call` messages with their
-`function_call_output` by call ID. Each entry reports the tool name, call and
-output addresses (`"path#index"`), success state with timestamps, and, for
-agent-oriented calls, the target agent and conversation parsed from the
-arguments.
-
-For calls carrying a delegated `agent_meta` receipt, the entry includes an
-`agent_meta` summary: receipt meta count, direct event IDs, receipt-only event
-IDs, the receipt direct token total, referenced `job=` paths, unresolved
-legacy receipt count, and any receipt warnings. Use `message_content` with the
-call or output address for the full arguments and output text; the summary
-never re-parses the output JSON.
-
-Set `page` (optionally `per_page`) to paginate the call list; totals,
-`by_tool`, and failure counts still cover every call. A session holds several
-persisted copies of the same logical call — socialized projections under
-`log/chats` (legacy), result chats, and job logs replay identical call ids and
-arguments — so with `dedupe: true` every later copy is marked with `copy_of`
-(the address of its first occurrence) and the result reports `copies` and
-`unique_calls` alongside the raw `total`, which keeps counting every evidence
-copy.
-
-The filter inputs narrow the call list itself: `tool` (tool name), `agent`
-(target agent), `conversation` (conversation name), `chat` (path part of the
-call address, the same short form the address carries), and `success`
-(`true`/`false` success state). All filters use **exact** equality — substring
-matching is deliberately not performed, so filter values must match the
-emitted field verbatim. A call missing a filtered field never matches, which
-also means `agent` only selects calls that carry a `target_agent`. Filtering
-follows the same convention as `dedupe`: the summary counts (`total`,
-`successes`, `failures`, `by_tool`, ...) are computed before filtering and
-stay raw, so they always describe the whole session while the `calls` list
-describes the filtered selection. `page`/`per_page` paginate the filtered
-list.
+## chat_range
+Inclusive retrieval of one message range from one chat, loading only the
+addressed chat. Inputs: `file`, `first`, `last` (zero-based, inclusive;
+`first == last` is valid), `raw` (default false). Task-level cap
+`MAX_RANGE_MESSAGES` (200): an oversized range raises `ParameterException`
+naming the cap and suggesting sub-ranges; the Ruby API `ChatAnalyst.range`
+stays uncapped. With `raw: true` the response carries the exact persisted
+`.chat` text of the slice (`Chat.print` of the selected messages, byte-exact,
+inside the JSON envelope's `raw` String) alongside the structured
+`messages` — the retired `extract_chat_range` semantics; only a job root
+(.info sidecar) is rejected as before.
 
 ## chat_tokens
-Deduplicated direct inference token usage with evidence locations
+Deduplicated direct-inference token accounting (scopes, conflicts, evidence
+locations) delegated to the core provenance token APIs. Inputs: `file`,
+`page`, `per_page`, `attribution` (default false). Legacy-compatible flat
+totals (`deduplicated_total` etc.) appear alongside the structured `scopes`
+Hash in the UNPAGINATED shape only: an event page (`page` set) carries the
+events plus paging metadata and `root` — no repeated scopes, flat totals,
+conflicts or warnings (phase-2 layering fix). With `attribution: true` the
+response also carries the attribution view (below), computed from its own
+single token-event fetch (the task's summary and view each fetch events
+once; the Ruby API accepts a prefetched report to share one fetch).
 
-The authoritative cost report for a session. Each direct inference event is
-counted once, keyed by `inference_id` (with the documented fallbacks for
-legacy records), and every event keeps all of its evidence locations, so any
-amount can be traced to the chat or receipt it was persisted in.
+## Attribution view (`ChatAnalyst.attribution` / `chat_tokens attribution:`)
 
-Read the totals as follows: `deduplicated_total` is the only global cost
-total; `chat_evidence` and `receipt_evidence` are overlapping coverage scopes
-and must never be summed; `receipt_only` is the disjoint delegated
-contribution with no saved child chat/log — the part that was invisible before
-receipts were accounted for. Job projection metadata and `*_c`/`*_s`
-checkpoints are never counted as inference usage. Events flagged `conflict`
-(disagreeing token fields or provider response IDs) are counted once from
-canonical evidence, so a total containing conflicts is best-effort rather than
-authoritative; `conflicts` and `incomplete_evidence` list those cases and
-`warnings` collects discovery problems.
+The promoted public method `ChatAnalyst.attribution(root)` (minimal revision
+phase 2, decision D2; formerly the delegation half of the retired
+`chat_report` composite) splits the deduplicated event list ONCE:
 
-Set `page` (optionally `per_page`) to page through the event list; every
-total (deduplicated, coverage scopes, receipt-only) still covers all events,
-so a paginated call is a bounded cost summary.
+- `total` — deduplicated total token fields plus an event count;
+- `root_chat_tokens`/`root_chat_events` — events whose canonical evidence
+  (`evidence.first`) lies in the root chat itself, or on a job root in the
+  job's OWN chats (generated result chat + direct log chats), never its
+  dependencies;
+- `delegated_tokens`/`delegated_events` — events whose canonical evidence
+  lies in any chat of a LINKED delegation job (own logs and result chats,
+  recursively through nested delegation jobs; frontier walk over receipt
+  job references plus the root job's own log-chat receipts, cycle-safe);
+- `unattributed_tokens`/`unattributed_events` — everything else;
+- `linked_jobs` — canonical job paths (the root job's own path excluded);
+- `unresolved_jobs` — referenced delegation jobs whose cost is missing
+  because the job could not be resolved (never nil; reference-less problems
+  are counted in `malformed_edges`).
 
-## chat_agents
-Agent interactions with receipt evidence and agent_job links
+`root + delegated + unattributed` reconciles with `total`. Standalone
+`ChatAnalyst.attribution` fetches events with exactly ONE `tokens` call
+(pinned by an instrumentation test); a caller that already holds a tokens
+report passes it via `tokens_report:` to share that single fetch.
 
-The task selects every delegation call — `ask`, `cortex_continue`,
-`cortex_brief`, any `hand_off_to_*` tool — and, as a generic fallback, any
-call whose `function_call_output` carries `agent_meta` receipt records, so
-delegation tools from other suites are never silently missed. It reports,
-per interaction: source chat, call ID, target agent (in the raw
-`Agent/brief` form when present) and conversation when present in the
-arguments, success state, the receipt summary (event IDs, receipt-only IDs,
-receipt token total, referenced jobs), the matching `agent_job` edge
-details, the linked producer Step, the child evidence classification
-(`receipt_only`, `log_only`, `both`, `receipt_unresolved`, or `none`), and
-the delegated cost rollup: `delegated_token_total` and
-`delegated_event_count`, the deduplicated tokens of the events whose
-canonical evidence lies in the union of the linked jobs' subtree chats.
+## Retired adapters (phase 2)
 
-Associations come exclusively from `agent_job` edge details recorded in the
-receipt, never from path or agent-name conventions. Use this task to answer
-"what did delegation cost and where did each delegated answer come from".
+The four Phase C legacy adapters — `message_index`, `message_content`,
+`extract_chat_range`, `chat_report` — were retired in the phase-2 minimal
+revision (plan step 5). Retired names raise `TaskNotFound`. Byte-for-byte
+snapshots of the deleted declarations plus SHA256SUMS live in
+`var/baselines/rev-phase2-removed/`. Their pinned coverage now lives on:
+`chat_messages` (whole-session indexing per chat), `chat_range` `raw: true`
+(raw slice text, first==last, range validation), `chat_tokens`
+`attribution: true` (delegation rollup, unresolved_jobs). Deliberate losses:
+`message_content`'s cross-chat batch fetch by flat id (the migrated agent
+issues one `chat_range` per chat) and `chat_report`'s session-dedup count
+plus first-10 failure list (`chat_tool_calls` carries the same raw counts and
+every call record locates its own failure detail).
 
-Set `page` (optionally `per_page`) to page through the interactions; the
-`failed` count still covers all of them.
+## chat_tool_calls
+Structured tree-wide tool-call index (minimal revision phase 1, plan step 4;
+declared in `lib/ChatAnalyst/tasks/api_tasks.rb`). Per-call records:
+`{chat, call_index, output_index?, tool, call_id?, status (:success/:failure/:unknown),
+delegated, delegation_target?, jobs, argument_characters, output_characters,
+copy_of?}` — a chat path plus integers, never a `"path#index"` string and never
+a legacy boolean `success`. Inputs: `file`, `page`, `per_page`, `dedupe`,
+`tool`, `agent`, `conversation`, `chat`, `success` (filters narrow the call
+list only; summary counts stay raw; `agent`/`conversation` are the two halves
+of `delegation_target` `"Agent#Conversation"`). Universe and dedupe identity
+are unchanged: overview chats plus each job's live log chats (uniq), copies
+marked through `tool_call_identity`/`mark_call_copies` (MD5 stays internal).
 
-## meta_evidence
-Unified meta evidence across ordinary messages and receipts
-
-One list of every metadata record a session offers, with its origin:
-`chat_meta` for a real persisted `meta:` message (address `meta_address`) and
-`agent_meta` for a delegated receipt entry embedded in a
-`function_call_output` (address `evidence_address`, plus `call_id`,
-`tool_name`, and `output_address`). Each record includes the parsed meta
-(truncated unless `full` is set, which also returns `raw_message` for
-receipts), its classification (`direct`, `job_projection`, or `other`), the
-job reference and inference/provider IDs when present, and receipt warnings.
-
-Use it when the question is "where are all the metadata records and what do
-they say", including reasoning summaries, without treating a receipt as a
-parent-chat message.
-
-## chat_reasoning
-Reasoning fields from messages and delegated receipts
-
-Returns every non-empty `reas=` reasoning field found by `meta_evidence`,
-from both ordinary chat meta and delegated receipts, each with its provenance:
-origin, address, inference and provider response IDs, timestamp, source, and
-for receipts the call ID, tool name, linked `agent_job` Step, and whether the
-event is receipt-only (no saved child log).
-
-By default each item is compact: an MD5 fingerprint, an 80-character prefix
-(and suffix for long fields), character count, and the evidence address. Pass
-the selected addresses in `addresses`, or set `full`, to retrieve the
-untruncated reasoning text for exactly those items. This two-phase pattern
-keeps large reasoning traces out of reports until they are needed.
-
-## chat_report
-Return a concise combined session snapshot
-
-The one-screen summary for a session: root, chat/job/edge counts,
-`agent_job` edge count, the deduplicated and receipt-only token totals with
-event counts, multi-evidence and conflict/incomplete counts, tool-call totals,
-the first failures, up to three receipt summaries, warnings, and a delegation
-block. The delegation block reports, per linked job, the tokens and event
-count of its subtree chats (deduplicated, uniq by job), plus the root chat
-tokens (canonical events in the root chat file and the root job's own
-chats), the summed delegated tokens, `unattributed_tokens` (the remainder,
-e.g. import-closure evidence), and `unresolved_jobs` from provenance
-warnings that report an unresolved job reference. `deduplicated_total`
-already includes resolved delegated subtrees; per-node subtree values may
-overlap when several calls link the same job. The delegation block also
-carries `malformed_edges`, the count of reference-less unresolved-receipt
-warnings (malformed agent_job edges), which are kept out of
-`unresolved_jobs` so that list stays strings-only. Use it as the first
-answer to "what happened here", then drill into the dedicated tasks.
-
-## provenance_relationships
-Chat-level import, continue, and last reference events and import closure
-
-Recover the fine-grained provenance relationships of any chat file. For each
-`import:`, `continue:`, or `last:` line found in the uncompiled chat text the
-task reports a reference event with type, raw reference, message index, and
-resolved target (through the `Chat.find_file` resolution order). Unresolved
-references are kept with `resolved: false` and an `unresolved_reason` instead
-of raising. A `targets` summary collapses events per target with reference
-counts and types, and `import_closure` lists the imported chats and the root
-in post-order, handling cycles.
-
-These references are not part of core provenance traversal, so this task is
-the complement of the core provenance tasks: use it to know exactly which
-chats a session imports, continues, or references with `last:`.
-
-## live_chats
-Discover the live chat logs of a session, newest first
-
-Pass a chat file or a job root (`file`). The task enumerates the chat logs of
-the session tree and returns them sorted by mtime, newest first, with `path`,
-`mtime`, `age` (seconds), `size`, and a `likely_active: true` flag on the
-newest entry — the log most likely receiving writes right now. On a job root
-the result also carries a `job` block with `status`, `running`, `done`,
-`error`, `aborted`, and `started`.
-
-Three sources are used, reported per entry as `source`: `provenance` is the
-default — the same core traversal (`Chat.provenance_chat_files`) every other
-task uses, so job logs, society conversations, and result chats appear with
-the usual relation rules; `glob` is the fallback for sessions where traversal
-yields nothing (a damaged job, a chat that has not saved a receipt yet) — a
-bounded recursive glob of `Chat::DIRECT_LOG_CHAT_GLOBS` under `<root>.files/`
-that recovers whatever logs are physically on disk; `jobs` adds workflow-
-delegated inferences that are **still running** — chats whose parent has not
-finished, so no provenance edge exists yet.
-
-The `jobs` source is derived from the transient `.jobs` files scout-ai keeps
-next to every chat save_file while delegated jobs are in flight: each holds
-bare `Step#short_path` lines (one per not-yet-done job). Those jobs are
-loaded and their files_dir scanned for `.chat` logs. The file exists only
-while its jobs are in flight (removed once they finish, success or failure,
-when the settled receipts land in the chat), so `jobs` entries are ephemeral
-signals of live work, not durable provenance — treat a chat that disappears
-from the `jobs` source as finished, not as gone. They carry an extra
-`jobs_file` field naming the `.jobs` file they were found through, and
-`provenance`/`glob` always win over `jobs` for the same chat, so nothing is
-reported twice. Discovery is seeded from the `.jobs` sibling of every
-save_file already in scope plus a `**/*.jobs` glob under the session
-files-dir, follows a discovered chat's own `.jobs` file up to depth 2 (the
-seeding file plus one jobs-of-jobs level — deeper chains are settled
-provenance territory by the time they matter), and guards every step: a
-missing job directory, an unresolvable reference, or a `.jobs` file that
-vanishes mid-read is skipped silently. Discovery never raises on damaged
-sessions.
-
-The `.jobs` path is derived exactly as scout-ai's writer derives it
-(`save_file.sub(/\.chat\z/, '') + '.jobs'`, anchored at the **extension**, so
-a sidecar save_file `parent.chat.files/agent.chat` has its `.jobs` at
-`parent.chat.files/agent.jobs`, i.e. the sibling of the chat file itself).
-The derivation is kept identical to scout-ai's
-`Chat.jobs_file(save_file)` so in-flight jobs are always found at the path
-the writer actually uses.
-
-Use this first when you are asked to watch a running chat and need to know
-which `agent.chat` is logging the current work.
-
-From a chat root, the top-level `<chat>.files/<name>.chat` agent transcript is
-part of the provenance set (it is where the session's `meta job=` references
-live); only a top-level file that is byte-identical to the root conversation —
-a legacy root copy — is excluded.
-
-## inbox_state
-Pending and delivered inbox messages of a chat
-
-Pass the chat file itself (the `save_file` whose inbox you inspect). The task
-returns `{save_file, files_dir, inbox_dir, inbox_removed_dir, pending,
-delivered}`: the inbox is a per-save-file sibling of the save_file, derived
-with the scout-ai helpers `Chat.inbox_dir` / `Chat.inbox_removed_dir` — for a
-sidecar agent save_file `<chat>.files/<agent>.chat` it is
-`<chat>.files/<agent>.inbox{,_removed}`, and for a top-level `parent.chat` it
-is `parent.inbox{,_removed}` in the same directory. `pending` are the regular
-top-level files in the inbox, `delivered` the files in the removed directory
-(sorted by name) — the record of everything already handed to the model.
-Each entry carries `name`, `mtime`, `size`, and the full `content`, because
-inbox notes are short advice by design.
-
-Missing directories yield empty lists, never an error: a chat that never
-received advice reports `pending: [], delivered: []`. The inbox is read while
-a live inference may be consuming it, so each entry is guarded: a note that
-disappears between listing and reading is skipped, never an error. The task
-rejects a job root with a `ParameterException`; pass the chat path directly.
-
-## post_inbox_advice
-Post advice into a live chat inbox
-
-Pass the chat file (`file`), the `message` text, and an optional `name` for
-the inbox file (default `<YYYYMMDD-HHMMSS>-advice.md`). The task creates
-the note `<name>` inside the save_file's sibling inbox
-(`Chat.inbox_dir(save_file)`; creating the directory with `mkdir_p`) with the
-message as content and returns the written path plus `name`, `save_file`,
-`inbox_dir`, `size`, and a `note` describing delivery semantics. To advise a
-live chat discovered with `live_chats`, post against that chat's own
-save_file so the note lands in its own inbox.
-
-This is the scout-ai `inbox` prompt strategy from the consumer side: the note
-is delivered as a `{role: 'user'}` message on the **next real inference** of
-that chat. Delivery is consume-once — the file is moved into the save_file's
-sibling `.inbox_removed` directory (mtime preserved, numeric `.1`, `.2`
-suffix on collision) before its content is read, so a notice can never be
-delivered twice — and
-cache hits skip the prompt preparation entirely, so a note posted while the
-chat is on cache stays pending until a real inference happens. Injected
-messages are seen by the model but never persisted in the transcript;
-that removed directory is the only delivery record. Confirm uptake by
-re-checking `inbox_state` for the file moving from `pending` to `delivered`.
-
-The name must be a plain file name (no `/`), the message must not be blank,
-and an existing inbox note is never silently overwritten. The name `abort` is
-reserved (scout-ai's `Chat::INBOX_ABORT_FILE`): a file with that name is
-consumed to abort the live inference and its content never reaches the model,
-so posting advice under it raises a `ParameterException` before anything is
-written — advice must never be able to kill an inference. Because these
-tasks are jobs keyed on `file`, a repeated `inbox_state` call with the same
-input returns the cached result; use a distinct job id to force a fresh read.
+## chat_tool_call
+Full evidence for exactly ONE tool call (minimal revision phase 1, plan step
+2): `arguments` (parsed Hash when parseable, else the raw String),
+`argument_characters`, the actual persisted output content plus
+`output_characters`, `output_info?` (envelope fields sans content),
+`status`/`reason`/`error?`, `delegated`, `delegation_target?`, `jobs`,
+`timestamp?`/`start_timestamp?`. Inputs: `file` (chat path), `call_index`
+(the zero-based index of the function_call/mcp_call message that STARTS the
+call, matching the compact index). Raises `ArgumentError` naming the chat,
+the offending index and the valid call-start indices when no call starts at
+`call_index`. Detail counterpart of `chat_tool_calls`; single-message
+retrieval is `chat_range` with `first == last`.
 
 ## chat_accounting
-Separate accounting for a chat and every chat it imports
+Per-chat accounting with import-closure scopes (`own` / `closure`); calls the
+core token APIs, one entry per chat. Inputs: `file`, `scope`. Phase-2
+efficiency fix (D4 keep+fix): tokens/overview/relationships are computed ONCE
+per chat (own scope reuses the same fetched events for the closure merge;
+pinned by an instrumentation test — `ChatAnalyst.tokens` is called exactly
+once per chat in both scopes).
 
-Account a chat and each chat of its import closure separately, from its own
-file and with its own job/log provenance, so the root chat totals never absorb
-the cost of imported chats. With the default `scope: own` the task returns one
-entry per chat with messages, deduplicated token totals, token event count,
-conflicts, incomplete evidence, tool calls, direct jobs, warnings, and the
-list of imports (plus `unresolved_imports` when a reference cannot be
-resolved). With `scope: closure` it merges all closure events with
-`inference_id` deduplication into a single root entry, reporting token events
-per chat. Each entry also splits its cost: `direct_tokens` are the canonical
-events located in that chat file itself, while `delegated_tokens` (with the
-`delegated_subtrees` job list) are the canonical events in `agent_job`
-subtrees reachable from that chat. The existing `tokens` field keeps its old
-meaning, which includes delegated subtrees whenever the `follow` option
-resolves `agent_job` edges.
+## live_chats
+Operational live-chat discovery: compact-graph `live` listing plus the
+`DIRECT_LOG_CHAT_GLOBS` fallback for unsaved logs, newest-first with active
+flags. Input: `file`.
 
-This is the task for the progressive-import use case: run it on the latest
-chat of a chain and get the accounting of every previous chat separately. For
-example, with the chain `doc_inconsistencies <- documentation_fix <-
-provenance_issue`, running `chat_accounting` on `provenance_issue` returns one
-entry for `documentation_fix` (its own events, its own totals, plus its
-dangling `doc_inconsistencies` import under `unresolved_imports`) and one entry
-for `provenance_issue`; the root entry keeps only its own cost, so no imported
-chat is silently absorbed.
+## inbox_state / post_inbox_advice
+Operational inbox inspection and advice posting for a live inference; the
+reserved `abort` note name is rejected. Inputs: `file` (both), `message` +
+`name` (post_inbox_advice).

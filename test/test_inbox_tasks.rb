@@ -160,9 +160,13 @@ class TestInboxTasks < Test::Unit::TestCase
   end
 
   def test_live_chats_glob_fallback_finds_unsaved_logs
-    # A damaged job (dependencies entry unreadable) makes provenance
-    # traversal yield nothing; the bounded glob under `<root>.files/` still
-    # recovers the logs physically on disk.
+    # A damaged job (dependencies entry unreadable) is TOLERATED by the
+    # compact graph (Phase C): `live` globs the files directory directly and
+    # never depends on the dependencies, so the same logs physically on disk
+    # are recovered and the dependency error becomes a warning, not a
+    # traversal failure.  The recursive-glob fallback in the helper stays as
+    # a defensive path for a root the compact graph cannot even open; this
+    # fixture pins that damaged metadata no longer forces it.
     job = File.join(@dir, 'W', 'load', 'Damaged')
     files = job + '.files'
     FileUtils.mkdir_p(File.join(files, 'ask.society'))
@@ -172,7 +176,6 @@ class TestInboxTasks < Test::Unit::TestCase
     File.write(File.join(files, 'ask.society', 'child.chat'), "user: c\n")
 
     result = ChatAnalyst.job(:live_chats, {file: job}).run
-    assert_equal :glob, result[:source]
     paths = result[:chats].collect { |c| c[:path] }
     assert paths.include?(File.join(files, 'agent.chat'))
     assert paths.include?(File.join(files, 'ask.society', 'child.chat'))

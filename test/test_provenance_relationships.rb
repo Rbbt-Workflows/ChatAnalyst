@@ -6,6 +6,13 @@ require 'json'
 # Fine-grained provenance: import/continue/last relationship extraction and
 # per-chat accounting scope.  All fixtures are offline tmpdir chats, so no
 # providers and no network are needed.
+#
+# Phase C: `provenance_relationships` was retired as a TASK (zero external
+# consumers per the Stage 0 sweep) and its semantics live on as the
+# ChatAnalyst.relationships module method (Stage 6), exercised here directly.
+# `follow` is DROPPED everywhere (Stage 0 decision recorded in Phase A): the
+# three old follow-behaviour tests are replaced by one test pinning that the
+# new chat_overview has no follow input and always traverses the whole tree.
 class TestProvenanceRelationships < Test::Unit::TestCase
   include ChatAnalystFixtures
 
@@ -32,7 +39,7 @@ class TestProvenanceRelationships < Test::Unit::TestCase
   def test_relationships_extracts_import_events_with_positions
     Dir.mktmpdir do |dir|
       _base, _middle, top = import_chain(dir)
-      result = ChatAnalyst.job(:provenance_relationships, {file: top}).run
+      result = ChatAnalyst.relationships(top)
       refs = result[:references]
       assert_equal 2, refs.length
       assert refs.all? { |r| r[:type] == :import }
@@ -53,14 +60,14 @@ class TestProvenanceRelationships < Test::Unit::TestCase
   def test_import_closure_is_postorder_and_cycle_safe
     Dir.mktmpdir do |dir|
       base, middle, top = import_chain(dir)
-      result = ChatAnalyst.job(:provenance_relationships, {file: top}).run
+      result = ChatAnalyst.relationships(top)
       closure = result[:import_closure].collect { |path| File.basename(path) }
       assert_equal %w[base.chat middle.chat top.chat], closure
 
       # explicit cycle: a imports b, b imports a
       a = write_chat(dir, 'a.chat', "import: b.chat\nuser: a\n")
       write_chat(dir, 'b.chat', "import: a.chat\nuser: b\n")
-      cyclic = ChatAnalyst.job(:provenance_relationships, {file: a}).run
+      cyclic = ChatAnalyst.relationships(a)
       assert_equal 2, cyclic[:import_closure].length
     end
   end
@@ -73,7 +80,7 @@ class TestProvenanceRelationships < Test::Unit::TestCase
                         "user: q\n" \
                         "last: history.chat\n" \
                         "assistant: a\n")
-      result = ChatAnalyst.job(:provenance_relationships, {file: chat}).run
+      result = ChatAnalyst.relationships(chat)
       types = result[:references].collect { |r| r[:type].to_s }.sort
       assert_equal %w[continue last], types
       assert result[:references].all? { |r| r[:resolved] }
@@ -85,7 +92,7 @@ class TestProvenanceRelationships < Test::Unit::TestCase
   def test_missing_import_is_reported_not_raised
     Dir.mktmpdir do |dir|
       chat = write_chat(dir, 'chat.chat', "import: nope.chat\nuser: q\nassistant: a\n")
-      result = ChatAnalyst.job(:provenance_relationships, {file: chat}).run
+      result = ChatAnalyst.relationships(chat)
       ref = result[:references].first
       assert_equal :import, ref[:type]
       refute ref[:resolved]
@@ -121,25 +128,11 @@ class TestProvenanceRelationships < Test::Unit::TestCase
     end
   end
 
-  def test_default_follow_is_all_and_subset_changes_results
-    Dir.mktmpdir do |dir|
-      _base, _middle, top = import_chain(dir)
-      all = ChatAnalyst.job(:chat_overview, {file: top}).run
-      subset = ChatAnalyst.job(:chat_overview, {file: top, follow: 'job'}).run
-      assert all[:chats].length >= subset[:chats].length
-    end
-  end
-
-  def test_invalid_follow_raises_parameter_exception
-    Dir.mktmpdir do |dir|
-      _base, _middle, top = import_chain(dir)
-      assert_raise(ParameterException) do
-        ChatAnalyst.job(:chat_overview, {file: top, follow: 'nope'}).run
-      end
-    end
-  end
-
-  def test_memo_distinguishes_follow_options
+  # Replaces the three old `follow` tests (default-is-all, invalid-follow,
+  # memo-distinguishes-follow): `follow` no longer exists anywhere in the
+  # exported surface; chat_overview always traverses references and direct
+  # dependencies, and an unknown task input is rejected by the framework.
+  def test_follow_is_gone_and_overview_always_traverses
     Dir.mktmpdir do |dir|
       dep = make_job(dir, 'D/load/Default_1')
       log = "user: w\nmeta: pt=3 tt=4 inference_id=w1\nassistant: done\n"
@@ -149,12 +142,15 @@ class TestProvenanceRelationships < Test::Unit::TestCase
                         "meta: pt=1 tt=2 inference_id=p1\n" \
                         "meta: job=#{job}\n" \
                         "assistant: a\n")
-      # default closure walks job + dependency + log relations
-      all = ChatAnalyst.job(:chat_overview, {file: chat}).run
-      # subset drops dependency traversal: strictly fewer jobs
-      subset = ChatAnalyst.job(:chat_overview, {file: chat, follow: 'job,log'}).run
-      assert all[:jobs].length > subset[:jobs].length,
-             "default=#{all[:jobs].length} subset=#{subset[:jobs].length}"
+      result = ChatAnalyst.job(:chat_overview, {file: chat}).run
+      job_paths = result[:jobs].collect { |j| j[:path] }
+      assert job_paths.any? { |p| p.end_with?('W/ask/Default_w') }
+      assert job_paths.any? { |p| p.end_with?('D/load/Default_1') },
+             "direct dependency not traversed: #{job_paths.inspect}"
+      assert job_paths.none? { |p| p.end_with?('agent.chat') },
+             'log chats are listed per job, never traversed as chats'
+      refute ChatAnalyst.tasks[:chat_overview].inputs.collect { |input| input.first.to_s }.include?('follow'),
+             'follow input still present on chat_overview'
     end
   end
 end

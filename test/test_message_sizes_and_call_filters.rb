@@ -36,28 +36,28 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
     write_chat(File.join(dir, 'calls.chat'), text)
   end
 
-  def test_message_index_reports_character_counts_and_large_flag
+  def test_chat_messages_reports_character_counts_and_large_flag
     Dir.mktmpdir do |dir|
       path = sized_chat(dir)
-      result = ChatAnalyst.job(:message_index, {file: path}).run
+      result = ChatAnalyst.job(:chat_messages, {file: path}).run
       assert result.all? { |message| Integer === message[:characters] }, 'every entry carries an integer characters'
       assert_equal [9, 9, 150_000, 4], result.collect { |message| message[:characters] }
       assert result.all? { |message| message.key?(:large) }, 'every entry carries the large key'
       assert_equal [false, false, true, false], result.collect { |message| message[:large] }
       # the meta entry keeps both keys even though it carries no content
-      meta_entry = result.find { |message| message[:role] == :meta }
+      meta_entry = result.find { |message| message[:role] == 'meta' }
       assert_equal 4, meta_entry[:characters]
       assert_equal false, meta_entry[:large]
     end
   end
 
-  def test_message_index_size_fields_survive_role_filter_and_pagination
+  def test_chat_messages_size_fields_survive_role_filter_and_pagination
     Dir.mktmpdir do |dir|
       path = sized_chat(dir)
-      only_user = ChatAnalyst.job(:message_index, {file: path, role: 'user'}).run
+      only_user = ChatAnalyst.job(:chat_messages, {file: path, role: 'user'}).run
       assert_equal [9, 150_000], only_user.collect { |message| message[:characters] }
 
-      paged = ChatAnalyst.job(:message_index, {file: path, page: 1, per_page: 3}).run
+      paged = ChatAnalyst.job(:chat_messages, {file: path, page: 1, per_page: 3}).run
       assert_equal 3, paged[:messages].length
       assert_equal 4, paged[:total]
       assert paged[:messages].all? { |message| message.key?(:characters) && message.key?(:large) }
@@ -68,21 +68,29 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       text = "user:\n\n#{'y' * 100_000}\n\nassistant:\n\n#{'z' * 100_001}\n"
       path = write_chat(File.join(dir, 'boundary.chat'), text)
-      result = ChatAnalyst.job(:message_index, {file: path}).run
+      result = ChatAnalyst.job(:chat_messages, {file: path}).run
       assert_equal [100_000, 100_001], result.collect { |message| message[:characters] }
       assert_equal [false, true], result.collect { |message| message[:large] }
       assert_equal 100_000, ChatAnalyst::LARGE_MESSAGE_CHARACTERS
     end
   end
 
+  # Minimal revision (plan step 4): chat_tool_calls emits STRUCTURED records
+  # (chat path + integers, no "path#index" strings, no legacy boolean
+  # success); target agent / conversation are the two halves of
+  # delegation_target "Agent#Conversation".
   def test_calls_chat_fixture_shape
     Dir.mktmpdir do |dir|
       path = calls_chat(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
       assert_equal 2, result[:total]
       ask = result[:calls].find { |call| call[:tool] == 'ask' }
-      assert_equal 'Worker', ask[:target_agent]
-      assert_equal 'Session', ask[:conversation]
+      assert_equal 'Worker#Session', ask[:delegation_target]
+      assert_equal 'Worker', ask[:delegation_target].split('#', 2).first
+      assert_equal 'Session', ask[:delegation_target].split('#', 2).last
+      # structured addressing, never a concatenated address string
+      assert result[:calls].none? { |call| call.key?(:call_address) }
+      assert Integer === ask[:call_index]
     end
   end
 
@@ -101,12 +109,12 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
       assert_equal 0, ChatAnalyst.job(:chat_tool_calls, {file: path, tool: 'askx'}).run[:calls].length
 
       failing = ChatAnalyst.job(:chat_tool_calls, {file: path, success: false}).run
-      assert failing[:calls].all? { |call| call[:success] == false }
+      assert failing[:calls].all? { |call| call[:status] == :failure }
       assert_equal ['bash'], failing[:calls].collect { |call| call[:tool] }
       assert_equal raw[:failures], failing[:failures]
 
       ok = ChatAnalyst.job(:chat_tool_calls, {file: path, success: true}).run
-      assert ok[:calls].all? { |call| call[:success] == true }
+      assert ok[:calls].all? { |call| call[:status] == :success }
       assert_equal raw[:successes], ok[:successes]
     end
   end
@@ -123,10 +131,10 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
       session = ChatAnalyst.job(:chat_tool_calls, {file: path, conversation: 'Session'}).run
       assert_equal ['ask'], session[:calls].collect { |call| call[:tool] }
 
-      chat_path = raw[:calls].first[:call_address].to_s.split('#', 2).first
+      chat_path = raw[:calls].first[:chat]
       by_chat = ChatAnalyst.job(:chat_tool_calls, {file: path, chat: chat_path}).run
       assert_equal raw[:calls].length, by_chat[:calls].length
-      assert by_chat[:calls].all? { |call| call[:call_address].to_s.start_with?("#{chat_path}#") }
+      assert by_chat[:calls].all? { |call| call[:chat] == chat_path }
 
       assert_equal 0, ChatAnalyst.job(:chat_tool_calls, {file: path, agent: 'Nobody'}).run[:calls].length
     end
@@ -139,7 +147,7 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
       assert_equal ['ask'], combined[:calls].collect { |call| call[:tool] }
 
       paged = ChatAnalyst.job(:chat_tool_calls, {file: path, success: false, page: 1, per_page: 5}).run
-      assert paged[:calls].all? { |call| call[:success] == false }
+      assert paged[:calls].all? { |call| call[:status] == :failure }
       assert_equal 1, paged[:calls].length
       assert paged.key?(:total_pages), 'pagination envelope is applied to the filtered list'
     end

@@ -74,32 +74,43 @@ class TestPaginationAndCopies < Test::Unit::TestCase
       assert_equal 2, paged[:events].length
       assert_equal 2, paged[:total_pages]
       assert_equal 3, paged[:total]
-      # totals still cover all events, not just the page
-      assert_equal result[:deduplicated_total][:tt], paged[:deduplicated_total][:tt]
+      # Minimal revision phase 2 (plan step 5 layering): an event page is a
+      # PAGE, not a repeated summary — it carries events + paging metadata +
+      # root only, and the flat totals stay on the unpaginated shape.
+      assert_equal %i[page per_page total total_pages next_page prev_page events root],
+                   paged.keys.sort_by { |key| paged.keys.index(key) }
+      assert_equal parent, paged[:root][:path]
+      refute paged.key?(:deduplicated_total), 'event page must not repeat summary totals'
+      refute paged.key?(:scopes), 'event page must not repeat scopes'
+      refute paged.key?(:conflicts), 'event page must not repeat conflicts'
+      refute paged.key?(:warnings), 'event page must not repeat warnings'
     end
   end
 
+  # chat_agents was retired in Phase C (zero external consumers per the
+  # Stage 0 sweep; its delegation evidence lives on in chat_report's
+  # delegation section and the chat_tool_calls adapter records).  The
+  # pagination envelope behaviour this suite pins survives on chat_tokens.
   def test_chat_agents_pagination
     Dir.mktmpdir do |dir|
       parent, _worker = fixture_receipt_plus_log(dir)
-      result = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      assert_equal 1, result[:interactions].length
-
-      paged = ChatAnalyst.job(:chat_agents, {file: parent, page: 1, per_page: 1}).run
-      assert_equal 1, paged[:interactions].length
-      assert_equal 1, paged[:total]
+      error = assert_raise(TaskNotFound) { ChatAnalyst.job(:chat_agents, {file: parent}).run }
+      assert_match(/chat_agents/, error.message)
     end
   end
 
+  # chat_report was retired in phase 2; its failure/unique-call counting
+  # conveniences are NOT ported (deliberate loss: chat_tool_calls carries
+  # the same counts as summary fields on a strictly raw universe).
   def test_chat_report_counts_failures_and_unique_calls
     Dir.mktmpdir do |dir|
       path = fixture_with_calls(dir)
-      result = ChatAnalyst.job(:chat_report, {file: path}).run
-      assert_equal 6, result[:tool_calls]
-      assert_equal 3, result[:unique_tool_calls]
-      assert_equal 2, result[:failed_tool_calls]
-      assert_equal 2, result[:failures].length
-      assert_equal 2, result[:failures].collect { |call| call[:tool] }.count('bash')
+      result = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
+      assert_equal 6, result[:total]
+      assert_equal 2, result[:failures]
+      assert_equal 4, result[:by_tool]['bash']
+      error = assert_raise(TaskNotFound) { ChatAnalyst.job(:chat_report, {file: path}).run }
+      assert_match(/chat_report/, error.message)
     end
   end
 end

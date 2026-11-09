@@ -23,12 +23,17 @@ ChatAnalyst=/$PWD filter="*" {
   improvements
 
   timeline
+  timeline.analyze
+
+  new_implementation
 
  }
  lib=lib{
   ChatAnalyst=ChatAnalyst{
+   api.rb
    tasks=tasks{
-    timeline.rb
+    api_tasks.rb
+    legacy_adapters.rb
    }
   }
  }

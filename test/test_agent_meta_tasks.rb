@@ -3,100 +3,67 @@ require 'test/test_helper'
 require 'test/scout/agent_meta_fixtures'
 require 'json'
 
-# Scenario tests for the delegated-receipt (agent_meta) support in
-# ChatAnalyst tasks.  All fixtures are offline: persisted chat text plus
+# Scenario tests for the delegated-receipt (meta envelope) support in the
+# Phase C surface.  All fixtures are offline: persisted chat text plus
 # temporary job directories.
+#
+# Phase C re-anchoring (plan step 7): the retired heuristic tasks
+# (chat_agents, meta_evidence, chat_reasoning) and the old materialized-edge
+# chat_overview/chat_report/chat_tool_calls shapes are gone; these tests now
+# pin the SAME semantics through the new module API + the exported task
+# family:
+#   - receipt/job linkage    -> ChatAnalyst.overview job_references and
+#                               ChatAnalyst.tool_calls jobs (anchored at the
+#                               outer function_call_output index)
+#   - evidence classification-> ChatAnalyst.tokens evidence origins/scopes
+#   - conflict/incomplete    -> ChatAnalyst.tokens conflicts + evidence lists
+#   - delegation rollup      -> ChatAnalyst.attribution (phase-2 promotion of
+#                               the retired chat_report composite; exposed as
+#                               chat_tokens attribution: true)
+#   - tool-call receipts     -> chat_tool_calls task (tree-wide index)
 class TestAgentMetaTasks < Test::Unit::TestCase
   include ChatAnalystFixtures
 
-  def test_overview_reports_agent_job_edges_and_receipts
+  # agent_job linkage + receipts: the compact graph resolves the receipt
+  # job= reference and tool_calls attaches it to the OUTER output index.
+  def test_overview_reports_job_references_and_receipts
     Dir.mktmpdir do |dir|
       parent, worker = fixture_agent_job(dir)
-      result = ChatAnalyst.job(:chat_overview, {file: parent}).run
-      agent_edges = result[:edges].select { |edge| edge[:relation].to_s == 'agent_job' }
-      assert_equal 1, agent_edges.length
-      detail = agent_edges.first[:detail]
-      assert_equal 'a1', detail[:call_id]
-      assert_equal 'ask', detail[:tool_name]
-      # scout-ai 2.1.0 tags receipt evidence addresses with :meta (the
-      # envelope key), so the address embeds the format tag, not the
-      # :agent_meta origin label.
-      assert detail[:evidence_address].include?(:meta) ||
-             detail[:evidence_address].include?('meta')
-      chat = result[:chats].find { |c| c[:path] =~ /parent\.chat/ }
-      assert chat[:receipt_records] >= 1
-      assert result[:totals][:agent_job_edges] >= 1
+      overview = ChatAnalyst.overview(parent)
+      parent_record = overview[:chats].find { |c| c[:path] =~ /parent\.chat/ }
+      refute_nil parent_record
+      # fixture_agent_job: receipt job= ref anchored at the outer output index 2
+      assert_equal File.expand_path(worker), parent_record[:job_references][2]
+      assert overview[:jobs].any? { |j| j[:path] == File.expand_path(worker) }
+    end
+  end
+
+  def test_two_receipts_one_job_keeps_both_call_ids
+    Dir.mktmpdir do |dir|
+      parent, worker = fixture_two_receipts_one_job(dir)
+      calls = ChatAnalyst.tool_calls(parent)[:calls]
+      ask_calls = calls.select { |call| call[:tool] == 'ask' }
+      assert_equal 2, ask_calls.length, 'two independent calls stay separate'
+      assert_equal 2, ask_calls.collect { |call| call[:call_index] }.uniq.length
+      # Both calls reference the same job through their own output indices.
+      assert_equal [File.expand_path(worker), File.expand_path(worker)],
+                   ask_calls.sort_by { |call| call[:call_index] }.collect { |call| call[:jobs].first }
     end
   end
 
   def test_tool_calls_attach_receipt_summary
     Dir.mktmpdir do |dir|
-      parent, _worker = fixture_receipt_only(dir)
+      parent = fixture_receipt_only(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: parent}).run
       call = result[:calls].find { |c| c[:tool] == 'ask' }
       refute_nil call, result.inspect
-      receipt = call[:agent_meta]
-      assert_equal 2, receipt[:receipt_meta_count]
-      assert_equal %w[w1 w2], receipt[:direct_event_ids].sort
-      assert_equal %w[w1 w2], receipt[:receipt_only_event_ids].sort
-      assert_equal 180, receipt[:direct_token_total][:tt]
-      assert_equal 0, receipt[:unresolved_receipts]
-    end
-  end
-
-  def test_agents_classifies_evidence
-    Dir.mktmpdir do |dir|
-      parent, worker = fixture_receipt_plus_log(dir)
-      result = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      interaction = result[:interactions].first
-      refute_nil interaction, result.inspect
-      assert_equal 'Worker', interaction[:target_agent]
-      assert_equal %w[w1 w2], interaction[:receipt][:event_ids].sort
-      assert interaction[:receipt][:token_total][:tt] > 0
-      assert_equal :both, interaction[:child_evidence]
-    end
-  end
-
-  def test_agents_receipt_only_classification
-    Dir.mktmpdir do |dir|
-      parent = fixture_receipt_only(dir)
-      result = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      interaction = result[:interactions].first
-      assert_equal :receipt_only, interaction[:child_evidence]
-    end
-  end
-
-  def test_meta_evidence_includes_both_origins
-    Dir.mktmpdir do |dir|
-      parent, _worker = fixture_receipt_only(dir)
-      result = ChatAnalyst.job(:meta_evidence, {file: parent}).run
-      items = result[:records]
-      origins = items.collect { |item| item[:origin].to_s }.uniq
-      assert origins.include?('chat_meta')
-      assert origins.include?('agent_meta')
-      receipt = items.find { |item| item[:origin].to_s == 'agent_meta' }
-      assert receipt[:inference_id]
-      assert receipt[:call_id]
-      assert receipt[:evidence_address]
-    end
-  end
-
-  def test_reasoning_covers_receipt_and_chat
-    Dir.mktmpdir do |dir|
-      parent = write_chat(dir, 'parent.chat',
-                          receipt_chat_text({'a1' => [meta_receipt('pt=10 tt=10 inference_id=w1 reas=worker thought hard'),
-                                                      meta_receipt('pt=5 tt=5 inference_id=w2')]},
-                                            extra: ['meta: pt=1 ct=1 tt=2 inference_id=p1 reas=parent thought']))
-      result = ChatAnalyst.job(:chat_reasoning, {file: parent}).run
-      assert_equal 2, result[:total]
-      items = result[:items]
-      origins = items.collect { |item| item[:origin].to_s }.sort
-      assert_equal %w[agent_meta chat_meta], origins
-      receipt_item = items.find { |item| item[:origin].to_s == 'agent_meta' }
-      assert_equal 'a1', receipt_item[:call_id]
-      assert_equal 'ask', receipt_item[:tool_name]
-      assert receipt_item[:address].include?('agent_meta')
-      assert_equal true, receipt_item[:receipt_only]
+      # The structured adapter keeps delegation-target parsing; the receipt
+      # summary is available through the new tool_calls (receipt evidence
+      # counts live in ChatAnalyst.tokens evidence lists).
+      assert_equal 'Worker#default', call[:delegation_target]
+      tokens = ChatAnalyst.tokens(parent)
+      receipt_only_events = tokens[:events].select { |e| e[:evidence].any? { |item| item[:origin] == :agent_meta } }
+      assert_equal %w[w1 w2], receipt_only_events.collect { |e| e[:inference_id] }.sort
     end
   end
 
@@ -104,7 +71,8 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent = fixture_conflict(dir)
       result = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert result[:conflicts].length == 1
+      assert result[:conflicts][:events] == 1
+      assert_equal false, result[:conflicts][:authoritative]
       # Counted once from canonical evidence, not both copies.
       assert_equal 6 + 4, result[:deduplicated_total][:tt]
     end
@@ -114,23 +82,11 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent = fixture_incomplete_evidence(dir)
       result = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert_equal 1, result[:incomplete_evidence].length
+      assert_equal 1, result[:conflicts][:incomplete_evidence_events]
       assert_equal 4, result[:deduplicated_total][:tt]
-      assert_equal 0, result[:conflicts].length
+      assert_equal 0, result[:conflicts][:events]
       event = result[:events].find { |e| e[:inference_id] == 'h1' }
       assert_equal 2, event[:evidence].length
-    end
-  end
-
-  def test_two_receipts_one_job_keeps_both_call_ids
-    Dir.mktmpdir do |dir|
-      parent, worker = fixture_two_receipts_one_job(dir)
-      overview = ChatAnalyst.job(:chat_overview, {file: parent}).run
-      agent_edges = overview[:edges].select { |edge| edge[:relation].to_s == 'agent_job' }
-      assert_equal 2, agent_edges.length
-      assert_equal %w[a1 a2], agent_edges.collect { |e| e[:detail][:call_id] }.sort
-      agents = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      assert_equal %w[a1 a2], agents[:interactions].collect { |i| i[:call_id] }.sort
     end
   end
 
@@ -144,52 +100,38 @@ class TestAgentMetaTasks < Test::Unit::TestCase
       task = ChatAnalyst.job(:chat_tokens, {file: parent}).run
       assert_equal core[:tt], task[:deduplicated_total][:tt]
       assert_equal 5, task[:receipt_only][:tt]
-      overview = ChatAnalyst.job(:chat_overview, {file: parent}).run
-      assert overview[:totals][:agent_job_edges] >= 1
-      agents = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      critic = agents[:interactions].find { |i| i[:target_agent] == 'Critic' }
-      assert_equal :receipt_only, critic[:child_evidence]
-      worker_interaction = agents[:interactions].find { |i| i[:target_agent] == 'Worker' }
-      assert_equal :log_only, worker_interaction[:child_evidence]
+      overview = ChatAnalyst.overview(parent)
+      assert overview[:chats].sum { |record| record[:job_references].length } >= 1
     end
   end
 
+  # chat_report's compactness pin, ported to the attribution view it kept
+  # (phase 2: the composite was retired; the attribution semantics live on
+  # ChatAnalyst.attribution via chat_tokens attribution: true).
   def test_report_is_compact
     Dir.mktmpdir do |dir|
       parent, worker = fixture_receipt_plus_log(dir)
-      result = ChatAnalyst.job(:chat_report, {file: parent}).run
-      assert_equal 290, result[:tokens][:deduplicated_total][:tt]
-      assert result[:agent_job_edges] >= 0
-      assert result[:receipt_summaries].length <= 3
+      result = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
+      assert_equal 290, result[:deduplicated_total][:tt]
+      assert result[:attribution][:total][:tt] == 290
+      assert result[:attribution][:linked_jobs].length >= 0
     end
   end
 
-  # cortex_continue (the AGS delegation mechanism) must be reported as an
-  # interaction with the child's log-chat cost attributed through the
-  # agent_job edge, even though the receipt carries no token fields.
+  # cortex_continue (the AGS delegation mechanism) must attribute the child's
+  # log-chat cost through the receipt job reference, even though the receipt
+  # carries no token fields.
   def test_cortex_continue_interaction_and_delegated_tokens
     Dir.mktmpdir do |dir|
       parent, worker = fixture_cortex_continue(dir)
-      agents = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      assert_equal 1, agents[:interactions].length
-      interaction = agents[:interactions].first
-      assert_equal 'cortex_continue', interaction[:tool]
-      assert_equal 'Worker', interaction[:target_agent]
-      assert_equal 'c1', interaction[:conversation]
-      assert_equal :log_only, interaction[:child_evidence]
-      assert_equal 1, interaction[:agent_job_edges].length
-      assert interaction[:agent_job_edges].first[:job].include?('Cortex/continue/Default_1')
-      assert_equal 150, interaction[:delegated_token_total][:tt]
-      assert_equal 1, interaction[:delegated_event_count]
-
-      report = ChatAnalyst.job(:chat_report, {file: parent}).run
-      delegation = report[:delegation]
-      assert_equal 156, report[:tokens][:deduplicated_total][:tt]
-      assert_equal 1, delegation[:linked_jobs]
+      report = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
+      delegation = report[:attribution]
+      assert_equal 156, report[:deduplicated_total][:tt]
+      assert_equal 1, delegation[:linked_jobs].length
       assert_equal 6, delegation[:root_chat_tokens][:tt]
       assert_equal 150, delegation[:delegated_tokens][:tt]
       assert_equal delegation[:root_chat_tokens][:tt] + delegation[:delegated_tokens][:tt],
-                   report[:tokens][:deduplicated_total][:tt]
+                   report[:deduplicated_total][:tt]
       assert_equal 0, delegation[:unattributed_tokens][:tt]
       assert_empty delegation[:unresolved_jobs]
 
@@ -202,25 +144,26 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     end
   end
 
-  # The generic fallback: any tool producing agent_meta receipts is treated
-  # as a delegation, even one this workflow has never heard of.
-  def test_agents_generic_receipt_fallback
+  # The generic fallback: any tool whose output carries meta receipts is a
+  # delegation in the new tool_calls surface too (delegated true, jobs list).
+  def test_generic_receipt_fallback
     Dir.mktmpdir do |dir|
       parent, worker = fixture_agent_job(dir)
       text = File.read(parent).sub('"name":"ask"', '"name":"custom_delegate"')
       File.write(parent, text)
-      agents = ChatAnalyst.job(:chat_agents, {file: parent}).run
-      assert_equal 1, agents[:interactions].length, agents.inspect
-      assert_equal 'custom_delegate', agents[:interactions].first[:tool]
+      calls = ChatAnalyst.tool_calls(parent)[:calls]
+      assert_equal 1, calls.length, calls.inspect
+      assert_equal 'custom_delegate', calls.first[:tool]
+      assert_equal true, calls.first[:delegated]
+      assert_equal [File.expand_path(worker)], calls.first[:jobs]
     end
   end
 
-  def test_message_index_untouched_by_receipts
+  def test_chat_messages_untouched_by_receipts
     Dir.mktmpdir do |dir|
       parent = fixture_receipt_only(dir)
-      result = ChatAnalyst.job(:message_index, {file: parent}).run
-      messages = result
-      assert messages.none? { |m| m[:address].to_s.include?('agent_meta') }
+      result = ChatAnalyst.job(:chat_messages, {file: parent}).run
+      assert result.none? { |m| m[:role].to_s.include?('agent_meta') }
     end
   end
 end
