@@ -1,0 +1,788 @@
+# Phase 3 frozen data contract — ChatAnalyst TSV surface
+
+Bout: ChatAnalyst phase 3, bout 2 (PLAN STEP 2). This file FREEZES the
+complete phase-3 data contract before any task is converted. Every later
+bout (plan steps 3-11) builds against this contract; changes after this
+bout must be logged as deviations in the bout record and, when they alter
+a pinned decision, re-approved.
+
+Load path for every probe and test: `/home/mvazque2/git/scout-ai/lib`
+(bash spelling `/bulk/mvazque2/git/scout-ai/lib`).
+
+## 0. Consumed artifacts (sha256, recorded at bout start)
+
+```
+5da848437102a227d8b6f0a38dfbfd2ff771eefc660deb7cc0cfc2980857fd3d  research/phase3-stage0-notes.md
+e24549a3a38966dcf25148af0536d3dabaa459c8aae7cfeb08966bf966b7c68c  lib/ChatAnalyst/api.rb
+918ce0a38b6eef05bd1a56a03dab12f40a12aeb6cbb655f686af6e083ce8591c  lib/ChatAnalyst/tasks/api_tasks.rb
+6910f1bccaec677c9b98a21bc4d618addb913595a1800bd500d7cc58d691271c  workflow.rb
+94eca8117b715afc392d4080f50a3636311f5c8e36149e6a577fd33a8bea49b7  start_chat
+362d06efb495a6c02a268ed1e81689e55ce12773e0e071f1964ed39ba8087c2d  README.md
+c660d3bcb4d68cec7f821c283800f0850894babe75622530ec9da780e29ec576  tmp/rev-phase2/final-confirm.log
+6608225ca7e662cf8e5860e4472d81d4c84e64aeb1a938c397c92be712ed5068  test/test_helper.rb
+3f331cbeb51a13efe5dc3780344d2a768aef5d2021c8d8954f95044a0d42a2e5  test/test_canonical_paths.rb
+2fc4a3dcbd7ca1bf928fd4e3e617f64e62da1a9b0db10936c845adcbb9ad67e1  tmp/phase3-stage0/receipts/probe-b2.out
+1827516b13a1b522d0474c0c84e192877da26e62c00b7d52e0c25935da318fa9  tmp/phase3-stage0/receipts/probe-c.out
+02dc667a3775fe400bbe067f02135e77ca59c73abc09f5b0d5d4d46dfe7d7af1  tmp/phase3-stage0/receipts/probe-g.out
+7b0b676ed7e6c7ccb74772b578fd036b78e1bcf9e0cb498c3ce6172e6c679698  tmp/phase3-stage0/receipts/probe-i.out
+0af6d7d63e5d61a8579ab5e4b2e94d233d78da53a1e90379176f6f52b6282b7b  tmp/phase3-b2/probe_cast_bool.rb
+ce2ed32ad6533dba646662acf994bc9218cf0153818f670435f065e97702d276  tmp/phase3-b2/probe_freeze.rb
+```
+
+Freeze-bout probes (this bout, executed fresh): `tmp/phase3-b2/probe_freeze.rb`
+(receipt `tmp/phase3-b2/receipts/probe-freeze.out`) and
+`tmp/phase3-b2/probe_cast_bool.rb` (receipt
+`tmp/phase3-b2/receipts/probe-cast-bool.out`). Findings folded into the
+decisions below:
+
+- `cast: :to_b` does NOT exist in the loaded stack (`NoMethodError:
+  undefined method 'to_b' for an instance of String` when the parser
+  applies it) — booleans are pinned as strings (receipts
+  `tmp/phase3-b2/receipts/probe-cast-bool.out` and probe-freeze A).
+- UTC `iso8601(3)` timestamps: lexical sort == chronological sort on a
+  5-point sample spanning years; no TAB/NEWLINE/CR inside; a
+  `+01:00`-offset input normalizes to `...Z`. WRITER-SIDE PARSER NOTE
+  (folded in during implementation): Ruby's `Time.parse` on an
+  ISO-8601-with-milliseconds string DROPS the fractional seconds
+  (`Time.parse("2026-02-03T12:00:00.500+01:00")` =>
+  `11:00:00.000Z`); `Time.iso8601` keeps them. The frozen timestamp
+  encoder therefore uses Time objects directly, then strict
+  `Time.iso8601`, then lenient `Time.parse` as the last resort; the
+  millisecond-truncation behavior is pinned by test.
+- A literal `\N` cell round-trips verbatim and stays distinct from an
+  empty cell after `TSV.open` (both in `:list` tables).
+- Registering the same annotation name twice via `TSV.annotation` is
+  harmless (dump and reopen unaffected); registration is idempotent in
+  effect. (Folded in during implementation, probe D of
+  probe_freeze.rb.)
+- Cast `:to_i` empty cell -> nil, re-confirmed.
+
+## 1. Global encoding rules (apply to every task below)
+
+### 1a. Entity-ID grammar
+
+Escaping table (applied to PATH COMPONENTS of every identifier and to
+every path-valued key or cell; single-pass, no re-scanning):
+
+| raw character | escape |
+|---|---|
+| `%` | `%25` |
+| `#` | `%23` |
+| TAB | `%09` |
+| NEWLINE | `%0A` |
+| CR | `%0D` |
+
+CR is INCLUDED (decision 1c of stage-0 §4, direction accepted): TSV holds
+CR verbatim, but a one-character-symmetry escape costs nothing and removes
+a whole class of CR/LF-normalization accidents at file boundaries. The
+table is closed: no other character is escaped, and `%` sequences not in
+the table are left alone on unescape only in their exact table spellings
+(unescape recognizes exactly `%25 %23 %09 %0A %0D`).
+
+Identifier forms:
+
+- **Chat** = absolute canonical chat path, `Chat.provenance_path(:chat,
+  ...)` spelling (the EXISTING canonical form; no new canonical spelling
+  is invented). The `/home`-vs-`/bulk` device-tree fact documented in
+  `test/test_canonical_paths.rb` stays as-is: they are different device
+  trees, only this checkout is bind-mounted at the `/bulk` spelling, and
+  `Chat.provenance_path` resolves to whichever spelling the running
+  process's canonicalization yields. In TSV cells/keys the path is
+  escaped per the table.
+- **Job** = absolute canonical job path (`Chat.provenance_path(:job,
+  step)` spelling). A DISTINCT entity type from Chat even when a
+  chat-producing job and its output chat share one path (the overview
+  visited-set already keys on the kind pair).
+- **Message** = `escaped_chat_path + '#' + decimal_index`, zero-based
+  index into that chat's parsed message sequence. The separator is the
+  LAST raw `#` possible only because the path is escaped (a raw `#`
+  cannot survive in the path part); splitting the whole id on `#` yields
+  exactly two parts for a plain message id.
+- **Inference** = the Message id of its meta message (one inference per
+  meta message).
+- **Tool call** = the Message id of its call-start message
+  (function_call / mcp_call).
+- **Activity cluster** = the Message id of its FIRST inference (see 1h;
+  scoped by root + max_gap_seconds, not persistent across parameter
+  changes — re-derivable, never stored as an identity).
+- **Token event** = the event's core identity rendered as
+  `escaped(identity parts).join('#')` — e.g. `inference_id#w1`,
+  `provider_response_id#resp_1`, `lineage#L47`, `receipt#<escaped
+  evidence_address>`. The identity Array is the core's grouping key
+  (scout-ai provenance/tokens.rb), so it is unique per deduplicated
+  event; each element is path-escaped before joining (the 1a CLOSED
+  table: `#`/`%`/TAB/NEWLINE/CR — NOT URL encoding; `|`, `~`, space
+  stay literal), so an evidence address containing `#`/`%`/TAB cannot
+  corrupt the join.
+- **Inbox note** = absolute note path (escaped in cells).
+
+Composite row keys (pairs), all built with the SAME `#` join over escaped
+components (key uniqueness is test-enforced):
+
+- (chat, role): `escaped_chat_path + '#' + role`
+- (message, reference occurrence):
+  `message_id + '#' + reference_type + '#' + occurrence`, occurrence
+  1-based among references of the same (message, reference_type), in the
+  order the sources yield them (graph array order for job references,
+  message order for relationship references). ALWAYS three trailing
+  segments — no conditional presence.
+  NOTE: `reference_type` itself contains no `#` by construction (it is
+  one of the five enumeration values), so the composite grammar stays
+  unambiguous; `token_event_id` composites are the general case handled
+  by the escaped-token-event-id rule above.
+- (call, job): `call_message_id + '#' + escaped_job_path`
+- (event, evidence occurrence): `token_event_id + '#' + occurrence`
+  (1-based, canonical evidence first).
+
+Because every component is escaped, splitting any composite key on `#`
+recovers the parts unambiguously.
+
+### 1b. Null convention (SETTLED — direction accepted)
+
+- String columns: the sentinel `\N` (two characters: backslash, N) means
+  NULL. The empty string `""` ALWAYS means empty string, never null.
+  Tests must and do distinguish `\N` from `""` after dump/reopen.
+- Cast numeric columns (`:to_i`/`:to_f` tables): native empty cell =>
+  nil (executed fact, probes C and freeze probe E). No sentinel needed.
+- The absent-trailing-cell asymmetry (a `:single` row whose last cell is
+  physically absent reads nil) is NEVER relied upon: every table in this
+  contract is `:list`, every row is written with ALL cells present.
+- The `|` invariant: no `|` inside any multi-value cell (the dumper
+  rejoins multi-values with `|`; a `|` inside a value would corrupt
+  read-back). Multi-value columns in this contract carry only paths,
+  controlled names and enumerations, all `|`-free by construction; the
+  writers validate this.
+
+### 1c. Cast rule and boolean encoding (SETTLED)
+
+- Global cast only, Symbol form (`:to_i` / `:to_f`). Per-field Hash cast
+  is banned (silently dropped — stage-0 1b).
+- A table casts ONLY when EVERY field is numeric. Mixed tables stay
+  all-Strings; numeric values in mixed tables are decimal strings
+  (`42`, `3.5`, `-1`). Decision 4 of stage-0 §4 accepted: the analytical
+  consumer is the ChatAnalyst agent reading TSV text, and decimal-string
+  counts are directly comparable; native Integer cells are reserved for
+  the purely numeric tables where they are free.
+- Booleans: the strings `true` / `false`; NULL is `\N`. There is NO
+  `:to_b` cast in the loaded stack (freeze probe A: NoMethodError when
+  the parser tries to apply it). No current consumer needs native
+  booleans (stage-0 2c: the only consumer is the ChatAnalyst agent
+  itself); if one appears later, the read-side helper decodes the
+  strings — the encoding does not change.
+
+### 1d. Timestamp format (SETTLED)
+
+UTC ISO 8601 with millisecond precision, `Time#utc.iso8601(3)` — the
+SAME spelling the scout-ai core writer uses for meta timestamps
+(`Time.now.utc.iso8601(3)`, provenance/live.rb:1077). Verified sortable
+(lexical == chronological), TSV-safe (no TAB/NEWLINE/CR), and
+normalizing (offset inputs become `Z`). PARSER ORDER (pinned by test
+during this bout's implementation): a Time input is used as-is (a
+`to_s` round-trip LOSES sub-second precision under the lenient
+parser); a String input goes strict `Time.iso8601` FIRST (it preserves
+milliseconds where Ruby's lenient `Time.parse` silently drops them),
+falling back to lenient `Time.parse` for non-ISO spellings (e.g.
+`2026-02-03 12:00:00.500 +0100`). Writers normalize any parseable
+input to this form; a missing OR unparseable timestamp becomes NULL
+(`\N`) in String tables — the existing `timeline_safe_timestamp`
+keep-only-if-parseable policy, with normalization added. Never invent a
+timestamp.
+
+### 1e. Allowed cell content (restated from the approved spec)
+
+Allowed: identifiers, paths, controlled enumerations, timestamps,
+counts, sizes, token numbers, booleans, foreign keys, short structured
+values (tool_name, target_agent, target_conversation). Excluded
+everywhere: message bodies, reasoning text, tool argument/output
+content, exception messages, note contents, nested structures as
+strings. `chat_message`/`chat_range` (`:chat` outputs) and `inbox_note`
+(`:text` output) are the ONLY body-carrying surfaces, by design.
+
+### 1f. Pagination and metadata annotations
+
+Mechanism (stage-0 settled 3): module-level `TSV.annotation` DSL;
+registered once at library load (see 1g); values ride the `#:` line and
+survive both `TSV.open` and task persistence (`Step#load.load`).
+Scalar values only; no TAB/NEWLINE inside annotation strings; an absent
+directive means nil (correct for next_page/prev_page). CRITICAL SAFETY
+RULE discovered during this bout's implementation: a raw `#` inside an
+annotation VALUE corrupts the `#:`-line grammar (the directives are
+`#:`-joined), so every PATH-valued annotation carries the ESCAPED
+canonical path (the 1a escape table removes `#`, TAB and NEWLINE, which
+is exactly the set the annotation line cannot hold).
+
+Pagination semantics (unchanged from the current JSON envelope): the
+inputs `page` (1-based Integer) and `per_page` (Integer, default 50,
+minimum 1) exist on every task marked "paginated"; pagination is APPLIED
+only when `page` is given; page bounds the main list only, never totals;
+out-of-range page yields an empty row set, not an error; `total` always
+counts the unpaginated universe.
+
+Registered annotation names (complete list — additions beyond the
+settled DSL set are marked and justified):
+
+| name | used by | justification |
+|---|---|---|
+| `page`, `per_page`, `total`, `total_pages`, `next_page`, `prev_page` | every paginated task | settled DSL set |
+| `root_path` | every rooted task | settled DSL set |
+| `max_gap_seconds` | cluster tasks | settled DSL set |
+| `first`, `last` | chat_range, chat_message | ADDITION: a `:chat` output carries no envelope; without these the slice loses its addressing. Escaped path goes in `root_path`; indices here. |
+| `scope` | chat_accounting | ADDITION: distinguishes own/closure result shape of the same task name. |
+| `filters` | chat_tool_calls | ADDITION: comma-joined `k=v` list of applied filters so the artifact self-describes which subset it holds. |
+| `chats`, `jobs`, `delegations` | chat_overview | ADDITION: summary counts (decision 3 below). |
+| `clusters`, `inferences`, `unclustered` | chat_activity_clusters | ADDITION: summary counts (decision 3 below). |
+| `conflicts`, `incomplete_evidence` | chat_tokens | ADDITION: token-summary quality flags the JSON surface carried; they are scalars and belong with the summary. |
+
+### 1g. Annotation-registration placement
+
+`lib/ChatAnalyst/tsv_base.rb` registers ALL names from 1f via one
+`TSV.annotation` call at load. It is required from `workflow.rb`
+immediately after `ChatAnalyst/api` (and therefore before any task file
+that builds tables), so every task run and every test that loads the
+workflow — test_helper requires workflow.rb — sees the accessors.
+Duplicate registration is harmless (freeze probe C). The full registered
+list is the 1f table (19 names). `TSV.parse_header` remains the
+registration-free fallback reader for consumers outside the workflow.
+
+### 1h. Activity-cluster model (contract for plan step 3; AMENDED bout 3, C1)
+
+An activity cluster is a maximal run of CONSECUTIVE TIMESTAMPED
+inferences (in the chronologically sorted, tree-wide inference sequence)
+whose adjacent gaps are at most `max_gap_seconds`. Missing-timestamp
+policy (C1 amendment; the user-approved spec is authoritative over the
+frozen text here): ONLY timestamped inferences participate in
+clustering. An inference whose timestamp is missing/unparseable joins
+NO cluster, carries NO `activity_cluster_id` (the `\N` null in the
+TSV), and influences no gap computation — it never bridges two distant
+clusters. `unclustered` is a real, possibly-nonzero count of exactly
+these inferences. Cluster id = Message id of the cluster's first
+inference. Clusters are scoped by (root, max_gap_seconds) and are never
+persisted as identities.
+`chat_activity_cluster` MUST reuse `chat_activity_clusters`' computation
+through a Scout task dependency (`dep ... step(:chat_activity_clusters)
+.load`), never recompute independently — the same-clustering-validation
+requirement of the spec.
+
+## 2. Task surface (frozen)
+
+Notation per task: inputs (name: type, default); output kind; key_field;
+fields with per-field encoding; pagination; annotations; FK columns;
+null policy beyond the global rules. "int-str" = decimal string in an
+all-String table; "int" = native via table-wide cast. All `file` inputs
+are `:path`, required, jobname; pagination inputs as in 1f. Rooted tasks
+carry `root_path`; every table carries `total` when paginated and may
+carry it unpaginated (writers always set it — a table's row count is
+cheap and self-describing).
+
+### A. Overview and relationship tables
+
+**chat_overview** — converted in place from JSON (same name).
+- Inputs: `file: path (required)`, `root_type: string, nil`.
+- Output `:tsv`, type `:list`, key_field `Chat`, cast none (mixed).
+- Fields per chat row: `messages` int-str; `references` int-str (count of
+  provenance references: job references + delegations; relationship
+  references import/continue/last are NOT included — they belong to
+  chat_references); `warnings` int-str.
+- No pagination (one row per chat of the tree; bounded by tree size).
+- Annotations: `root_path`, `total`, `chats`, `jobs`, `delegations`
+  (summary counts: chats = row count, jobs = jobs in tree, delegations =
+  delegation references across chats — all derived by the traversal it
+  already performs; decision 3).
+- FK: key -> Chat.
+
+**job_overview** — NEW.
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `Job`, cast none.
+- Fields: `result_chat` escaped path or `\N` (no chat-typed result);
+  `dependency_count` int-str; `live_log_count` int-str.
+- No pagination. Annotations: `root_path`, `total`.
+- FK: key -> Job; `result_chat` -> Chat.
+
+**chat_references** — NEW (absorbs the references the old chat_overview
+JSON embedded plus relationship references).
+- Inputs: `file: path (required)` (chat file).
+- Output `:tsv`, type `:list` (aligned-by-construction per stage-0
+  settled 1 — the `one2one` decision), key_field `Reference` = composite
+  `message_id#reference_type#occurrence`, cast none.
+- Fields: `source_message_id` (Message FK; redundant with key by design —
+  alignment), `reference_type` enumeration `job_reference | delegation |
+  import | continue | last` (SETTLED: the two core kinds `dependencies`
+  and `live` are EXCLUDED — dependencies are the job_dependencies
+  relation (spec A), live sidecars are mutable work-in-flight belonging
+  to live discovery (live_chats/chat_live_report); stage-0 2b mapping
+  table confirmed every spec name has a core counterpart and no core
+  kind is lost), `target_kind` `job | chat`, `target_id` escaped path
+  for path targets, RAW `agent#conversation` for delegation targets
+  (never escaped: it is not a path), `\N` when unresolved, `resolved`
+  bool-string, `unresolved_reason` `\N | remote | missing`.
+- No pagination (bounded by reference count of one chat). Annotations:
+  `root_path`, `total`.
+- FK: `source_message_id` -> Message; `target_id` -> Job or Chat by
+  `target_kind`.
+
+**job_dependencies** — NEW (direct edges only).
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `Dependency` = composite
+  `owner_job#dependency#position`, cast none.
+- Fields: `owner_job` escaped path (alignment copy), `dependency`
+  escaped path, `position` int-str (1-based, DECLARED order).
+- No pagination. Annotations: `root_path`, `total`.
+- FK: both path fields -> Job.
+
+**job_dependencies_recursive** — NEW (recursive-closure surface;
+SETTLED — direction accepted: a SEPARATE task, because option-driven
+output-shape switching is cache-unfriendly in Scout and blurs the
+one-table-one-relation rule; `job_dependencies` stays the unchanged
+direct list).
+- Inputs: `file: path (required)`, `max_depth: integer, 10`.
+- Output `:tsv`, type `:list`, key_field `Dependency` = composite
+  `dependency#depth`, cast none.
+- Fields: `dependency` escaped path, `depth` int-str (1 = direct
+  dependency of a root-owned job), `via_owner` escaped path (the owner
+  that declared the edge; first in traversal order when several do).
+- Semantics: BFS over job dependencies with a visited set on canonical
+  dependency paths; a dependency already reported at a smaller depth is
+  not repeated; equal-depth duplicates collapse to the first via_owner;
+  traversal stops at `max_depth` (rows at depth == max_depth carry no
+  further expansion). Cycle-safe by the visited set.
+- No pagination. Annotations: `root_path`, `total`, `max_depth` is NOT
+  an annotation (it is not in the settled set; it rides the Scout job
+  inputs — adding it was considered and rejected to keep the annotation
+  list closed).
+- FK: both path fields -> Job.
+
+**chat_role_counts** — NEW.
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `ChatRole` = composite
+  `chat#role`, cast `:to_i` (single numeric field).
+- Fields: `count` int (native).
+- No pagination. Annotations: `root_path`, `total`.
+
+### B. Message and inference tables
+
+**chat_messages** — converted in place.
+- Inputs: `file: path (required, chat file)`, `role: string, nil`,
+  `page`, `per_page`.
+- Output `:tsv`, type `:list`, key_field `Message`, cast none.
+- Fields: `role` enumeration string, `characters` int-str, `timestamp`
+  iso-or-`\N`, `large` bool-string (threshold constant unchanged).
+- Paginated when `page` given; `role` filter narrows the list only.
+- Annotations: pagination set + `root_path`.
+- FK: key -> Message.
+
+**chat_message** — NEW (single-message `:chat` retrieval).
+- Inputs: `message_id: string (required)` (the Message id grammar; the
+  chat is recovered by parsing it — no separate file input).
+- Output `:chat` — the byte-exact persisted text of that ONE message
+  (`Chat.print` of the message object).
+- Annotations: `root_path` (escaped chat path), `first` = `last` =
+  index.
+- Errors: malformed id or out-of-range index raise ArgumentError (task
+  layer maps to ParameterException), consistent with the existing
+  message-index validation messages.
+
+**chat_range** — converted in place.
+- Inputs: `file: path (required, chat file)`, `first: integer
+  (required)`, `last: integer (required)`.
+- Output `:chat` — the byte-exact persisted slice. "Raw mode kept" is
+  honored by making the exact-bytes form THE output (the old `raw: true`
+  behavior); the `raw` INPUT is retired because it is now inherent, and
+  the old envelope fields (chat/first/last) move to annotations
+  (`root_path`, `first`, `last`). Recorded as a pinned detail, not a
+  silent change.
+- The `MAX_RANGE_MESSAGES` cap and the chat-file-only guard stay
+  unchanged.
+
+**chat_inferences** — NEW (AMENDED bout 3, C2: ROOT-scoped, tree-wide —
+spec notation `chat_inferences(root)`, same family as
+`chat_tool_calls(root)`; the compact DEFAULT temporal entry point
+remains chat_activity_clusters, and this task is the explicit,
+paginated drill-down).
+- Inputs: `file: path (required, root chat or job)`,
+  `max_gap_seconds: integer, 120`, `page`, `per_page`, `chat: string,
+  nil` (OPTIONAL narrowing filter over the tree's chats, exactly
+  chat_tool_calls' filter pattern: filters narrow the listed rows only,
+  summary counts stay raw; applied at the task layer over the API's
+  tree-wide list).
+- Output `:tsv`, type `:list`, key_field `Inference` (= Message id of
+  the meta message), cast none. Rows in TREE-WIDE CHRONOLOGICAL order
+  (undated inferences sort last, deterministically by chat then index).
+- Fields: `timestamp` iso-or-`\N`, `reasoning_present` bool-string,
+  `reasoning_characters` int-str, `first_message_id` Message FK,
+  `last_message_id` Message FK, `trigger_message_id` Message FK or `\N`,
+  `assistant_message_id` Message FK or `\N`, `activity_cluster_id`
+  cluster id or `\N` (undated inferences join no cluster; 1h/C1),
+  `tool_call_count` int-str.
+- Paginated when `page` given. Annotations: pagination set +
+  `root_path`, `max_gap_seconds`.
+- FK: key -> Inference; the four message ids -> Message;
+  `activity_cluster_id` -> Activity cluster.
+- Universe: the overview chats (provenance closure of the root: root
+  chat plus referenced/result chats; live log chats stay OUT — they are
+  mutable copies and the token evidence owns dedup semantics).
+
+### C. Activity clusters
+
+**chat_activity_clusters** — NEW (replaces chat_timeline's temporal
+grouping role; semantic phases were already removed in phase 2).
+- Inputs: `file: path (required, root chat or job)`,
+  `max_gap_seconds: integer, 120`.
+- Output `:tsv`, type `:list`, key_field `Cluster` (= Message id of the
+  cluster's first inference), cast none. COMPACT INDEX ONLY — no member
+  lists.
+- Fields: `first_timestamp` iso-or-`\N`, `last_timestamp` iso-or-`\N`,
+  `duration_seconds` decimal string or `\N`, `inference_count` int-str,
+  `chats` multi-value escaped paths (`|`-joined, invariant 1b),
+  `tool_call_count` int-str, `delegation_count` int-str.
+- No pagination (bounded by cluster count). Annotations: `root_path`,
+  `max_gap_seconds`, `total`, `clusters` (= total), `inferences`,
+  `unclustered` (real count of undated inferences; 1h/C1).
+- FK: key -> Activity cluster; `chats` -> Chat.
+
+**chat_activity_cluster** — NEW (member detail).
+- Inputs: `file: path (required, root)`, `cluster_id: string
+  (required)`, `max_gap_seconds: integer, 120`.
+- Output `:tsv`, type `:list`, key_field `Inference`, fields identical
+  to chat_inferences' field list (one row per member inference, in
+  chronological order).
+- MUST consume `chat_activity_clusters` through a Scout task dependency
+  and load its persisted result (`dep` + `step(:...)...load`; the
+  stage-0 1f pinned pattern) so the SAME clustering computation produces
+  index and members; cluster_id is validated against that result — an
+  unknown id raises (ParameterException at the task layer).
+- Annotations: `root_path`, `max_gap_seconds`, `total`.
+- FK: as chat_inferences.
+
+### D. Tool-call tables
+
+**chat_tool_calls** — converted in place (tree-wide index; universe
+unchanged: overview chats plus each job's live log chats, uniq).
+- Inputs: `file`, `page`, `per_page`, `dedupe: boolean, false`,
+  `tool: string, nil`, `agent: string, nil`, `conversation: string,
+  nil`, `chat: string, nil`, `success: boolean, nil` (filters narrow
+  the list only; summary counts raw — unchanged semantics).
+- Output `:tsv`, type `:list`, key_field `ToolCall` (= call-start
+  Message id), cast none.
+- Fields: `output_message_id` Message FK or `\N` (no output message),
+  `tool` tool_name, `call_id` provider call id or `\N`, `status`
+  `success | failure | unknown`, `reason` `\N` or short controlled
+  reason (never exception text), `timestamp` iso-or-`\N`,
+  `start_timestamp` iso-or-`\N`, `argument_characters` int-str,
+  `output_characters` int-str, `inference_id` Inference FK or `\N` (call
+  belongs to no inference), `delegated` bool-string, `target_agent` or
+  `\N`, `target_conversation` or `\N` (split from the delegation target
+  `agent#conversation`), `copy_of` ToolCall FK or `\N` (call-start
+  message id of the original), `source_kind` `primary | copy` (primary
+  iff copy_of is `\N`).
+- Paginated when `page` given. Annotations: pagination set +
+  `root_path`, `filters` (comma-joined applied filters).
+- FK: key -> Tool call; `output_message_id` -> Message; `inference_id`
+  -> Inference; `copy_of` -> Tool call.
+
+**chat_tool_call** — converted in place, REDUCED to metadata only (spec
+D; recorded behavior change: the current JSON task returns full
+arguments and output content — the TSV task does not; sizes and
+locations replace bodies, per 1e).
+- Inputs: `file: path (chat file)`, `call_index: integer (required)`.
+- Output `:tsv`, type `:list`, one row, key_field `ToolCall`, field list
+  identical to chat_tool_calls.
+- Annotations: `root_path`, `total` (=1).
+
+**chat_tool_call_jobs** — NEW (flat call->job table).
+- Inputs: `file: path (root)`.
+- Output `:tsv`, type `:list`, key_field `CallJob` = composite
+  `call_message_id#escaped_job_path`, cast none.
+- Fields: `job` escaped path (alignment copy).
+- No pagination. Annotations: `root_path`, `total`.
+- FK: key parts -> Tool call, Job.
+
+### E. Token tables
+
+**chat_tokens** — converted in place as the SUMMARY table (the event
+list and evidence move to their own tasks; the `attribution` input is
+retired in favor of chat_attribution — recorded).
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `Scope`, cast `:to_i` (all
+  fields numeric).
+- Fields: `pt`, `ct`, `tt`, `cct`, `cwt`, `rt` (native Integers). Rows:
+  `deduplicated_total`, `chat_evidence`, `receipt_evidence`,
+  `receipt_only` (evidence-coverage descriptions; chat_evidence and
+  receipt_evidence overlap and must not be summed — only
+  deduplicated_total and receipt_only compare additively; semantics
+  unchanged from the core).
+- No pagination. Annotations: `root_path`, `total` (=4), `conflicts`,
+  `incomplete_evidence` (int counts).
+
+**chat_token_events** — NEW (paginated event list).
+- Inputs: `file`, `page`, `per_page`.
+- Output `:tsv`, type `:list`, key_field `TokenEvent`, cast none
+  (mixed: strings + counts).
+- Fields: `pt`,`ct`,`tt`,`cct`,`cwt`,`rt` int-strings, `deduplication`
+  enumeration (`inference_id | provider_response_id | lineage |
+  receipt`), `conflict` bool-string, `incomplete_evidence` bool-string,
+  `canonical_source` escaped path or `\N`, `canonical_origin`
+  `chat_meta | agent_meta`.
+- Paginated when `page` given. Annotations: pagination set +
+  `root_path`.
+- FK: key -> Token event; `canonical_source` -> Chat.
+
+**chat_token_evidence** — NEW (aligned evidence rows).
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list` (aligned-by-construction), key_field
+  `Evidence` = composite `token_event_id#occurrence` (canonical evidence
+  is occurrence 1), cast none.
+- Fields: `origin` `chat_meta | agent_meta`, `source` escaped path,
+  `call_id` or `\N`, `tool_name` or `\N`, `meta_address` or `\N`
+  (chat_meta rows), `evidence_address` or `\N`, `output_address` or
+  `\N`, `agent_meta_index` int-str or `\N` (agent_meta rows).
+- No pagination. Annotations: `root_path`, `total`.
+- FK: key part 1 -> Token event; `source` -> Chat.
+
+**chat_accounting** — converted in place; a DISTINCT operation from
+chat_tokens (per-import accounting over the chat's closure, not
+scope totals). Full field list and own/closure scope semantics as in
+the section-4 retirement entry; this entry exists so section 2 covers
+every task alphabetically-placeable. Post-freeze placement
+clarification logged as a deviation in tmp/phase3-b2/bout2-record.md
+(content unchanged from the retirement-table definition).
+- Inputs: `file: path (required)`, `scope: own | closure, own`.
+- Output `:tsv`, type `:list`, key_field `Chat` (own scope: one row
+  per closure chat; closure scope: ONE merged row keyed by the root),
+  cast none.
+- Fields: `imports` multi (escaped paths), `unresolved_imports` multi,
+  `messages`, `pt`,`ct`,`tt`,`cct`,`cwt`,`rt` int-strings,
+  `token_events`, `conflicts`, `incomplete_evidence`, `tool_calls`,
+  `direct_jobs` int-str, `direct_pt`..`direct_rt`, `direct_events`
+  int-strings, `delegated_pt`..`delegated_rt`, `delegated_events`
+  int-strings, `delegated_subtrees` multi (escaped paths), `warnings`
+  int-str.
+- No pagination. Annotations: `root_path`, `total`, `scope`.
+
+**chat_attribution** — NEW (promoted from the retired `attribution:
+true` mode).
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `Bucket`, cast none (bucket is
+  a string).
+- Fields: `pt`,`ct`,`tt`,`cct`,`cwt`,`rt` int-strings, `events`
+  int-str. Rows: `root`, `delegated`, `unattributed` (semantics:
+  canonical-evidence-source split, unchanged from
+  ChatAnalyst.attribution).
+- No pagination. Annotations: `root_path`, `total` (=3),
+  `conflicts`, `incomplete_evidence` reused as quality flags, plus the
+  linked/unresolved job lists are NOT cells (multi-value paths; the
+  lists remain available through chat_overview/job surfaces — recorded
+  simplification; `linked_jobs`/`unresolved_jobs` counts were rejected
+  as annotation additions to keep the list closed).
+
+### F. Operational tasks
+
+**live_chats** — converted in place.
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `Chat` (canonical path),
+  cast none.
+- Fields: `mtime` iso, `age_seconds` decimal string, `size` int-str,
+  `likely_active` bool-string, `source` `provenance | glob | jobs`,
+  `jobs_file` escaped path or `\N` (only :jobs entries). Newest-first
+  ordering preserved; the job-root status block is dropped from the
+  table (it describes the ROOT, not a row; the root is addressable
+  through chat_overview/job_overview) — recorded simplification.
+- No pagination (bounded). Annotations: `root_path`, `total`.
+- Fail-soft semantics unchanged (vanishing chats skipped).
+
+**chat_live_report** — NEW (core live report; separate from file
+discovery exactly as the spec separates them).
+- Inputs: `file: path (required)`.
+- Output `:tsv`, type `:list`, key_field `Entry` = `reference` (job id)
+  when non-empty else escaped path, cast none.
+- Fields: `kind` `inference | workload_context | agent_activity |
+  dangling_job`, `path` escaped or `\N`, `state` or `\N`, `status` or
+  `\N`, `chat_task` or `\N`, `agent` or `\N`, `conversation` or `\N`,
+  `source` multi-value (`sidecar|agent_view|society` subset,
+  `|`-joined).
+- No pagination. Annotations: `root_path`, `total`.
+- Fail-soft unchanged (ChatAnalyst.live wraps core fail-soft).
+
+**inbox_state** — converted in place, INDEX ONLY (recorded behavior
+change authorized by the spec: note contents move to inbox_note).
+- Inputs: `file: path (required, chat save file)`.
+- Output `:tsv`, type `:list`, key_field `Note` (absolute note path,
+  escaped), cast none.
+- Fields: `state` `pending | delivered`, `name`, `mtime` iso, `size`
+  int-str.
+- No pagination. Annotations: `root_path`, `total`. Missing directories
+  = empty table, never error; race tolerance unchanged.
+
+**inbox_note** — NEW (the body surface for exactly one note).
+- Inputs: `file: path (required, chat save file)`, `name: string
+  (required)` (plain file name).
+- Output `:text` — the note's exact contents.
+- Missing note raises (ParameterException at the task layer); this is a
+  point read, not a discovery surface.
+
+**post_inbox_advice** — converted in place; every safeguard kept
+(chat-root guard, plain-name validation, non-empty message, reserved
+`abort` name rejection before any write, no-overwrite, default
+timestamped name).
+- Inputs: `file`, `message: string (required)`, `name: string, nil`.
+- Output `:tsv`, type `:list`, ONE row, key_field `Posted` (escaped
+  posted path), cast none.
+- Fields: `name`, `save_file` escaped, `inbox_dir` escaped, `size`
+  int-str. The delivery-semantics prose note is dropped from the result
+  (it is static boilerplate; it lives in the task desc and README) —
+  recorded simplification.
+- Annotations: `root_path` (= save file), `total` (=1).
+
+## 3. Settled decisions (the two the work order required, plus pins)
+
+1. **Null convention** (2b): `\N` sentinel in String columns; `""` =
+   empty string; cast numeric columns use native empty=>nil;
+   absent-trailing-cell asymmetry never relied upon. ACCEPTED as
+   directed.
+2. **Summary-counts placement** (2e; AMENDED bout 3, C3): split by
+   natural derivation — chat_overview annotations carry
+   `chats`/`jobs`/`delegations` (the overview traversal derives them
+   anyway); chat_activity_clusters annotations carry
+   `clusters`/`inferences`/`unclustered`. The cluster index KEEPS its
+   per-cluster `tool_call_count` and `delegation_count`: clustering
+   operates on inference records that already carry `tool_call_count`
+   (a chat_inferences field per the spec), so the cluster count is a
+   sum over members — free. The `chats` multi-value identifier list
+   itself serves as the chat identification; no redundant `chat_count`
+   is added. chat_overview never computes clusters. AMENDED as
+   directed (the original "not added because deriving them is
+   expensive" wording is superseded: once inferences carry the counts,
+   the cost argument fails).
+3. **Recursive dependency surface** (2f): separate task
+   `job_dependencies_recursive`; flat owner->dependency rows with
+   visited-set + depth cap (`max_depth`, default 10); direct list
+   unchanged. ACCEPTED as directed; name pinned as
+   `job_dependencies_recursive`.
+4. **Boolean encoding**: `true`/`false` strings, `\N` for NULL; no
+   `:to_b` exists (freeze probe A); no consumer needs native booleans.
+5. **Timestamp**: UTC `iso8601(3)`, normalize-or-NULL (1d).
+6. **CR escape**: `%0D` included (1a).
+7. **reference_type enumeration**: confirmed with both exclusions
+   (dependencies -> job_dependencies; live -> live discovery), evidence
+   stage-0 2b mapping table; no core kind is lost and no spec name lacks
+   a counterpart.
+
+## 4. Retirement and conversion list (all current JSON tasks)
+
+| current task | disposition | replacement |
+|---|---|---|
+| chat_overview | converted in place | chat_overview (:tsv, §2A) |
+| chat_timeline | RETIRED | chat_activity_clusters + chat_inferences |
+| chat_messages | converted in place | chat_messages (:tsv, §2B) |
+| chat_range | converted in place | chat_range (:chat; `raw` input retired, 2B) |
+| chat_tool_call | converted in place, reduced | chat_tool_call (metadata only, §2D) |
+| chat_tool_calls | converted in place | chat_tool_calls (:tsv, §2D) |
+| chat_tokens | split | chat_tokens (summary) + chat_token_events + chat_token_evidence + chat_attribution |
+| chat_accounting | converted in place | chat_accounting (:tsv; own/closure scopes preserved via `scope` annotation; per-closure-chat rows in own scope, one merged row in closure scope; fields = the §2F accounting columns: imports multi, unresolved_imports multi, messages, pt..rt, token_events, conflicts, incomplete_evidence, tool_calls, direct_jobs, direct_pt..rt, direct_events, delegated_pt..rt, delegated_events, delegated_subtrees multi, warnings) |
+| live_chats | converted in place | live_chats (:tsv, §2F) |
+| inbox_state | converted in place, index-only | inbox_state + inbox_note |
+| post_inbox_advice | converted in place | post_inbox_advice (:tsv single row) |
+
+New tasks with no JSON predecessor: job_overview, chat_references,
+job_dependencies, job_dependencies_recursive, chat_role_counts,
+chat_message, chat_inferences, chat_activity_clusters,
+chat_activity_cluster, chat_tool_call_jobs, chat_token_events,
+chat_token_evidence, chat_attribution, chat_live_report, inbox_note.
+
+Baseline plan (`var/baselines/phase3-removed/`, executed per conversion
+bout, following the rev-phase2-removed pattern): snapshot each task's
+pre-conversion JSON source at the moment of its conversion, with a
+README naming the replacement; a `TaskNotFound` pin test for every name
+that VANISHES (chat_timeline only — converted names keep their names);
+behavior-change pins (not TaskNotFound) for the reductions the spec
+authorizes: chat_tool_call args/output absence, inbox_state content
+absence, chat_range raw-input absence, chat_tokens attribution-input
+absence.
+
+## 5. Ruby API adjustment list (contract for the step-3+ bouts)
+
+Targeted additions to lib/ChatAnalyst/api.rb (additive; no existing
+method signature changes):
+
+1. `ChatAnalyst::Ids` (THIS bout, lib/ChatAnalyst/ids.rb):
+   `escape_path`/`unescape_path` (1a table), `chat_id`/`job_id`
+   (canonical-path wrappers over the existing canonical behaviors —
+   `canonical_chat_path` and `Chat.provenance_path(:job, ...)`),
+   `message_id(chat_path, index)` / `parse_message_id(id)`,
+   `composite_key(*parts)` / `parse_composite(key)`,
+   `token_event_id(event)`. Malformed ids raise ArgumentError with the
+   observed-message style.
+2. `ChatAnalyst.inferences(root, max_gap_seconds: 120)` (AMENDED
+   bout 3, C2 — root-scoped, tree-wide): inference records over the
+   provenance-closure chats (the overview universe; live logs stay
+   OUT), one per inference meta, in the chat_inferences field shape
+   (message ids, reasoning presence/characters, tool-call count and
+   delegated-call count), tree-wide chronological order (undated last,
+   deterministic chat-then-index tiebreak). `activity_cluster_id` is
+   NOT part of this list computation alone — callers that need it use
+   activity_clusters' mapping (below); keeping the two computations
+   separate lets chat_inferences run without any clustering while the
+   cluster computation attaches ids to its own member records.
+3. `ChatAnalyst.activity_clusters(root, max_gap_seconds: 120)`: ONE
+   computation returning the compact cluster index records AND the
+   message_id -> cluster_id mapping AND summary counts
+   inferences/clusters/unclustered (1h model, C1 policy: only
+   timestamped inferences cluster; an undated inference joins no
+   cluster and influences no gap); `activity_cluster(root, cluster_id,
+   max_gap_seconds)` validates the id against the same computation
+   (unknown/foreign-scope ids raise ArgumentError at this layer;
+   ParameterException mapping happens at the task layer) and returns
+   member inference records in chronological order. Task layer wires
+   the dep+load reuse.
+4. `timeline_call_records` gains `inference_id` (Message id of the
+   owning inference; nil when the call belongs to none) and
+   `source_kind` derivation; `tool_calls`/`tool_call` records expose
+   them; target_agent/target_conversation split from
+   delegation_target.
+5. Clustering helper shared by 2-3 with the C1 policy (adjacent-gap
+   comparison over TIMESTAMPED inferences only; undated inferences are
+   excluded from runs and from gap computation).
+6. No changes to tokens/attribution/live/overview semantics — TSV
+   conversion is task-layer serialization over the existing shapes.
+
+## 6. Base layer delivered THIS bout (plan step 2 code part)
+
+Delivered sha256s (post-final-run; full list refreshed in
+`tmp/phase3-b2/delivered.sha256`): `lib/ChatAnalyst/ids.rb`
+e1c78531afc7909552b4fd78f1721a527d6a778dee83bbdd0579a880464bdc2a,
+`lib/ChatAnalyst/tsv_base.rb`
+4855f3d39e6613620bbd6a360ffd32cc9054e95cf7e1b8c2e79895f7b698e9b1,
+`test/test_phase3_base_layer.rb`
+aaaec7311c4c94a60a7a95dbbcb0983743a2db25c841ffb11ca4b408c3dd5fb1,
+`workflow.rb`
+a975c2f2add6737d14bec5b42e4273ec1512d4f464b92738e0135550a31cc24e,
+`README.md`
+0625e04e28078b1c3357b7cbca6d191a36eab006a0f9c6a79877d5596c1ba03d.
+This contract file itself (post-freeze final):
+8d5998a40658430a4477959300697772e2ab0a36a4b8e8406441119b5df9f556
+The freeze hash — the state against which step-3+ bouts compare
+deviations — is the earlier
+0c6e2f4b28fef2e6479b351dbb03134c7ef0189a7c4f818b22d338bdb4643c1b;
+post-freeze edits so far: one placement clarification (chat_accounting
+promoted from the retirement table to its own section-2 entry, content
+unchanged) logged in tmp/phase3-b2/bout2-record.md.
+Full-tree receipt: `tmp/phase3-b2/full-tree-run.log` — 24 suites,
+191 tests, 985 assertions, 0 failures, 0 errors (baseline 174/821 in
+22 suites; the new suite adds 17 tests / 164 assertions).
+
+- `lib/ChatAnalyst/ids.rb` — the 1a grammar (escape/unescape, message
+  ids, composite keys, token-event ids, canonical wrappers).
+- `lib/ChatAnalyst/tsv_base.rb` — annotation registration (1f list,
+  1g placement), encoders (`text`/`integer`/`float`/`boolean`/
+  `timestamp`/`path`), `build_table` (type/key_field/fields/cast/
+  annotations/rows) and read-side decoders. Explicit helpers only — no
+  metaprogrammed serializer framework.
+- `workflow.rb` — two require lines after `ChatAnalyst/api`.
+- `test/test_phase3_base_layer.rb` — grammar round-trips (%, #, TAB,
+  NEWLINE, CR; index parsing; malformed-id errors), encoder pins
+  (null vs "", boolean, timestamp normalization), TSV dump/open
+  round-trip with annotation survival, and a disposable scratch-task
+  persistence round-trip (task => :tsv through a real Scout job).
+- README section documenting the null/boolean/timestamp/escaping
+  conventions (appended at the end, `## Phase 3 TSV conventions`).
+
+NO production task is converted in this bout.

@@ -51,12 +51,13 @@ module ChatAnalystFixtures
   end
 
   # Create a job layout for a relative reference: result file, optional .info
-  # sidecar with dependencies, and log chats under <job>.files/log/<name>.
-  def make_job(dir, ref, result: 'answer', dependencies: [], logs: {})
+  # sidecar with dependencies (written even when empty when force_info:),
+  # and log chats under <job>.files/log/<name>.
+  def make_job(dir, ref, result: 'answer', dependencies: [], logs: {}, force_info: false)
     path = File.expand_path(File.join(dir, ref))
     FileUtils.mkdir_p(File.dirname(path))
     File.write(path, result)
-    File.write(path + '.info', {dependencies: dependencies}.to_json) if dependencies.any?
+    File.write(path + '.info', {dependencies: dependencies}.to_json) if dependencies.any? || force_info
     logs.each do |name, text|
       log_path = File.join(path + '.files', name)
       FileUtils.mkdir_p(File.dirname(log_path))

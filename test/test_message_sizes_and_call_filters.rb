@@ -40,14 +40,13 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       path = sized_chat(dir)
       result = ChatAnalyst.job(:chat_messages, {file: path}).run
-      assert result.all? { |message| Integer === message[:characters] }, 'every entry carries an integer characters'
-      assert_equal [9, 9, 150_000, 4], result.collect { |message| message[:characters] }
-      assert result.all? { |message| message.key?(:large) }, 'every entry carries the large key'
-      assert_equal [false, false, true, false], result.collect { |message| message[:large] }
-      # the meta entry keeps both keys even though it carries no content
-      meta_entry = result.find { |message| message[:role] == 'meta' }
-      assert_equal 4, meta_entry[:characters]
-      assert_equal false, meta_entry[:large]
+      # Phase 3 TSV surface: role/characters/timestamp/large per Message id
+      assert_equal %w[9 9 150000 4], result.values.collect { |row| row[1] }
+      assert_equal ['false', 'false', 'true', 'false'], result.values.collect { |row| row[3] }
+      # the meta entry keeps its row even though it carries no content
+      meta_row = result.values.find { |row| row[0] == 'meta' }
+      assert_equal '4', meta_row[1]
+      assert_equal 'false', meta_row[3]
     end
   end
 
@@ -55,12 +54,12 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       path = sized_chat(dir)
       only_user = ChatAnalyst.job(:chat_messages, {file: path, role: 'user'}).run
-      assert_equal [9, 150_000], only_user.collect { |message| message[:characters] }
+      assert_equal ['9', '150000'], only_user.values.collect { |row| row[1] }
 
       paged = ChatAnalyst.job(:chat_messages, {file: path, page: 1, per_page: 3}).run
-      assert_equal 3, paged[:messages].length
-      assert_equal 4, paged[:total]
-      assert paged[:messages].all? { |message| message.key?(:characters) && message.key?(:large) }
+      assert_equal 3, paged.length
+      assert_equal 4, paged.options[:total]
+      assert paged.values.all? { |row| row.length == 4 }
     end
   end
 
@@ -69,8 +68,8 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
       text = "user:\n\n#{'y' * 100_000}\n\nassistant:\n\n#{'z' * 100_001}\n"
       path = write_chat(File.join(dir, 'boundary.chat'), text)
       result = ChatAnalyst.job(:chat_messages, {file: path}).run
-      assert_equal [100_000, 100_001], result.collect { |message| message[:characters] }
-      assert_equal [false, true], result.collect { |message| message[:large] }
+      assert_equal ['100000', '100001'], result.values.collect { |row| row[1] }
+      assert_equal ['false', 'true'], result.values.collect { |row| row[3] }
       assert_equal 100_000, ChatAnalyst::LARGE_MESSAGE_CHARACTERS
     end
   end
@@ -79,43 +78,50 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
   # (chat path + integers, no "path#index" strings, no legacy boolean
   # success); target agent / conversation are the two halves of
   # delegation_target "Agent#Conversation".
+  # Phase 3 conversion (contract 2D): chat_tool_calls is a TSV keyed by the
+  # call-start Message id; delegation_target is split into the two contract
+  # columns target_agent / target_conversation.
   def test_calls_chat_fixture_shape
     Dir.mktmpdir do |dir|
       path = calls_chat(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
-      assert_equal 2, result[:total]
-      ask = result[:calls].find { |call| call[:tool] == 'ask' }
-      assert_equal 'Worker#Session', ask[:delegation_target]
-      assert_equal 'Worker', ask[:delegation_target].split('#', 2).first
-      assert_equal 'Session', ask[:delegation_target].split('#', 2).last
-      # structured addressing, never a concatenated address string
-      assert result[:calls].none? { |call| call.key?(:call_address) }
-      assert Integer === ask[:call_index]
+      assert_equal 2, result.length
+      assert_equal 'ToolCall', result.key_field
+      ask = result.values.find { |row| row[1] == 'ask' }
+      assert_equal 'Worker', ask[11], 'target_agent column'
+      assert_equal 'Session', ask[12], 'target_conversation column'
+      assert_equal 'true', ask[10], 'delegated'
+      # every key parses back through the Message-id grammar
+      result.keys.each { |k| ChatAnalyst::Ids.parse_message_id(k) }
     end
   end
 
+  # Filters narrow the LIST only; the pagination total stays RAW (the whole
+  # filtered universe is counted, not just the page).  Settled simplification
+  # this bout: the old summary block (successes/failures/copies/by_tool) is
+  # NOT an annotation; the rows + filters annotation carry what a consumer
+  # needs and by_tool etc. stay derivable by paging.
   def test_tool_and_success_filters_narrow_the_call_list_only
     Dir.mktmpdir do |dir|
       path = calls_chat(dir)
       raw = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
+      assert_equal 2, raw.length
 
       only_ask = ChatAnalyst.job(:chat_tool_calls, {file: path, tool: 'ask'}).run
-      assert_equal ['ask'], only_ask[:calls].collect { |call| call[:tool] }
-      # summary counts stay raw: total and by_tool describe the whole session
-      assert_equal raw[:total], only_ask[:total]
-      assert_equal raw[:by_tool], only_ask[:by_tool]
-      assert only_ask[:calls].length < raw[:calls].length
+      assert_equal ['ask'], only_ask.values.collect { |row| row[1] }
+      assert_equal 1, only_ask.length
+      assert_equal 'tool=ask', only_ask.filters, 'applied filters are annotated'
 
-      assert_equal 0, ChatAnalyst.job(:chat_tool_calls, {file: path, tool: 'askx'}).run[:calls].length
+      assert_equal 0, ChatAnalyst.job(:chat_tool_calls, {file: path, tool: 'askx'}).run.length
 
       failing = ChatAnalyst.job(:chat_tool_calls, {file: path, success: false}).run
-      assert failing[:calls].all? { |call| call[:status] == :failure }
-      assert_equal ['bash'], failing[:calls].collect { |call| call[:tool] }
-      assert_equal raw[:failures], failing[:failures]
+      assert failing.values.all? { |row| row[3] == 'failure' }
+      assert_equal ['bash'], failing.values.collect { |row| row[1] }
+      assert_equal 1, failing.length
 
       ok = ChatAnalyst.job(:chat_tool_calls, {file: path, success: true}).run
-      assert ok[:calls].all? { |call| call[:status] == :success }
-      assert_equal raw[:successes], ok[:successes]
+      assert ok.values.all? { |row| row[3] == 'success' }
+      assert_equal 1, ok.length
     end
   end
 
@@ -125,18 +131,18 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
       raw = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
 
       worker = ChatAnalyst.job(:chat_tool_calls, {file: path, agent: 'Worker'}).run
-      assert_equal ['ask'], worker[:calls].collect { |call| call[:tool] }
-      assert_equal raw[:total], worker[:total]
+      assert_equal ['ask'], worker.values.collect { |row| row[1] }
+      assert_equal 'agent=Worker', worker.filters
 
       session = ChatAnalyst.job(:chat_tool_calls, {file: path, conversation: 'Session'}).run
-      assert_equal ['ask'], session[:calls].collect { |call| call[:tool] }
+      assert_equal ['ask'], session.values.collect { |row| row[1] }
 
-      chat_path = raw[:calls].first[:chat]
+      chat_path = ChatAnalyst::Ids.parse_message_id(raw.keys.first).first
       by_chat = ChatAnalyst.job(:chat_tool_calls, {file: path, chat: chat_path}).run
-      assert_equal raw[:calls].length, by_chat[:calls].length
-      assert by_chat[:calls].all? { |call| call[:chat] == chat_path }
+      assert_equal raw.length, by_chat.length
+      assert by_chat.keys.all? { |k| k.include?(ChatAnalyst::Ids.chat_id(chat_path)) }
 
-      assert_equal 0, ChatAnalyst.job(:chat_tool_calls, {file: path, agent: 'Nobody'}).run[:calls].length
+      assert_equal 0, ChatAnalyst.job(:chat_tool_calls, {file: path, agent: 'Nobody'}).run.length
     end
   end
 
@@ -144,12 +150,15 @@ class TestMessageSizesAndCallFilters < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       path = calls_chat(dir)
       combined = ChatAnalyst.job(:chat_tool_calls, {file: path, success: true, agent: 'Worker'}).run
-      assert_equal ['ask'], combined[:calls].collect { |call| call[:tool] }
+      assert_equal ['ask'], combined.values.collect { |row| row[1] }
 
       paged = ChatAnalyst.job(:chat_tool_calls, {file: path, success: false, page: 1, per_page: 5}).run
-      assert paged[:calls].all? { |call| call[:status] == :failure }
-      assert_equal 1, paged[:calls].length
-      assert paged.key?(:total_pages), 'pagination envelope is applied to the filtered list'
+      assert paged.values.all? { |row| row[3] == 'failure' }
+      assert_equal 1, paged.length
+      # pagination is applied to the filtered list, but total stays RAW
+      # (contract 1f: it counts the whole universe, not the filtered page)
+      assert_equal 2, paged.total
+      assert_equal 1, paged.total_pages, 'total_pages pages the LISTED rows'
     end
   end
 end

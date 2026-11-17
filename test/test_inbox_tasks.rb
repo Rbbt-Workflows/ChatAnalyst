@@ -36,6 +36,11 @@ class TestInboxTasks < Test::Unit::TestCase
     "#{label}-#{File.basename(@__test_dir)}"
   end
 
+  # Phase 3: one TSV row as an IndifferentHash keyed by field name.
+  def row_for(result, key)
+    result[key]
+  end
+
   # Point Chat.load_job_reference's fallback bases at a tmp fixture tree so
   # `.jobs` references resolve hermetically (same technique as
   # test_job_reference_fallback.rb). Restores the shipped definition.
@@ -125,28 +130,36 @@ class TestInboxTasks < Test::Unit::TestCase
     job = fixture_job_root
     result = ChatAnalyst.job(:live_chats, {file: job}).run
 
-    paths = result[:chats].collect { |c| c[:path] }
+    # canonical absolute keys (the phase-3 fix: no ~/ shortening anywhere)
+    paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
     assert_equal File.join(job + '.files', 'agent.chat'), paths.first
     assert paths.include?(File.join(job + '.files', 'ask.society', 'child.chat'))
     assert paths.include?(File.join(job + '.files', 'worker.chat'))
+    assert paths.all? { |p| p.start_with?('/') && !p.include?('~') }
+    assert result.keys.none? { |k| k.include?('#') }, 'escaped keys carry no raw #'
 
-    # mtimes strictly non-increasing newest-first
-    mtimes = result[:chats].collect { |c| Time.parse(c[:mtime]) }
-    assert_equal mtimes.sort.reverse, mtimes
+    # mtimes strictly non-increasing newest-first (iso8601(3) cells)
+    mtimes = result.keys.collect { |k| row_for(result, k)['mtime'] }
+    parsed = mtimes.collect { |m| Time.parse(m) }
+    assert_equal parsed.sort.reverse, parsed
+    assert mtimes.all? { |m| m.match?(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\z/) }
 
-    assert_equal 3, result[:total]
-    assert_equal true, result[:chats].first[:likely_active]
-    assert result[:chats][1..].none? { |c| c[:likely_active] }
+    assert_equal 3, result.total
+    assert_equal 'true', row_for(result, result.keys.first)['likely_active']
+    assert result.keys[1..].none? { |k| row_for(result, k)['likely_active'] == 'true' }
 
-    # every entry carries a source tag
-    assert result[:chats].all? { |c| %i[provenance glob jobs].include?(c[:source]) }
+    # every entry carries a source tag; ages are decimal strings, sizes int
+    assert result.keys.all? { |k| %w[provenance glob jobs].include?(row_for(result, k)['source']) }
+    entry = row_for(result, result.keys.first)
+    assert entry['age_seconds'].match?(/\A\d+(\.\d+)?\z/)
+    assert_equal File.size(File.join(job + '.files', 'agent.chat')).to_s, entry['size']
 
-    # job status present on a job root
-    assert_equal 'done', result[:job][:status]
-    assert_equal :job, result[:root_kind]
-    entry = result[:chats].first
-    assert entry[:age].is_a?(Float)
-    assert_equal File.size(File.join(job + '.files', 'agent.chat')), entry[:size]
+    # RECORDED SIMPLIFICATION (pinned): the JSON job-root status block is
+    # gone; the root is addressable through chat_overview/job_overview.
+    assert !result.respond_to?(:job), 'status block dropped'
+    assert_equal 'Chat', result.key_field
+    assert_equal %w[mtime age_seconds size likely_active source jobs_file], result.fields
+    assert_nil result.options[:cast]
   end
 
   def test_live_chats_falls_back_to_glob_on_chat_without_files
@@ -154,9 +167,8 @@ class TestInboxTasks < Test::Unit::TestCase
     File.write(chat, "user: alone\n")
     result = ChatAnalyst.job(:live_chats, {file: chat}).run
 
-    assert_equal :chat, result[:root_kind]
-    assert result[:job].nil?
-    assert result[:chats].empty? || result[:chats].first[:path] == chat
+    paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
+    assert result.keys.empty? || paths.first == chat
   end
 
   def test_live_chats_glob_fallback_finds_unsaved_logs
@@ -176,11 +188,11 @@ class TestInboxTasks < Test::Unit::TestCase
     File.write(File.join(files, 'ask.society', 'child.chat'), "user: c\n")
 
     result = ChatAnalyst.job(:live_chats, {file: job}).run
-    paths = result[:chats].collect { |c| c[:path] }
+    paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
     assert paths.include?(File.join(files, 'agent.chat'))
     assert paths.include?(File.join(files, 'ask.society', 'child.chat'))
     assert_equal paths.length, paths.uniq.length
-    assert_equal true, result[:chats].first[:likely_active]
+    assert_equal 'true', row_for(result, result.keys.first)['likely_active']
   end
 
   def test_live_chats_chat_root_uses_sidecar_society_chats
@@ -196,9 +208,9 @@ class TestInboxTasks < Test::Unit::TestCase
     FileUtils.touch(File.join(files, 'ask.society', 'child.chat'), mtime: Time.now - 3)
 
     result = ChatAnalyst.job(:live_chats, {file: chat}).run
-    assert_equal :provenance, result[:source]
-    paths = result[:chats].collect { |c| c[:path] }
+    paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
     assert_equal [chat, File.join(files, 'ask.society', 'child.chat')], paths
+    assert result.keys.all? { |k| row_for(result, k)['source'] == 'provenance' }
   end
 
   def test_live_chats_chat_root_follows_top_level_transcript_refs
@@ -225,8 +237,7 @@ class TestInboxTasks < Test::Unit::TestCase
                "user: go\nmeta: job=#{job}\nassistant: done\n")
 
     root_run = ChatAnalyst.job(:live_chats, {file: chat}).run
-    assert_equal :provenance, root_run[:source]
-    root_paths = root_run[:chats].collect { |c| c[:path] }
+    root_paths = root_run.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
 
     transcript = File.join(files, 'agent.chat')
     assert_include root_paths, transcript,
@@ -241,7 +252,7 @@ class TestInboxTasks < Test::Unit::TestCase
     # exactly that set plus the root file.
     sidecar_run = ChatAnalyst.job(:live_chats, fresh_id('sidecar-root'),
                                   {file: transcript}).run
-    sidecar_paths = sidecar_run[:chats].collect { |c| c[:path] }
+    sidecar_paths = sidecar_run.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
     assert_equal root_paths.length, sidecar_paths.length + 1
     assert_equal (sidecar_paths + [chat]).sort, root_paths.sort
   end
@@ -269,14 +280,16 @@ class TestInboxTasks < Test::Unit::TestCase
       result = ChatAnalyst.job(:live_chats, fresh_id('inflight'), {file: job}).run
 
       child_chat = File.join(child_files, 'child_agent.chat')
-      entry = result[:chats].detect { |c| c[:path] == child_chat }
-      assert_not_nil entry, "delegated child chat not found: #{result[:chats].collect { |c| c[:path] }.inspect}"
-      assert_equal :jobs, entry[:source]
+      child_key = ChatAnalyst::Ids.chat_id(child_chat)
+      assert result.keys.include?(child_key), "delegated child chat not found: #{result.keys.inspect}"
+      entry = row_for(result, child_key)
+      assert_equal 'jobs', entry['source']
       # jobs entries carry the transient marker they were found through
-      assert_equal jobs_file, entry[:jobs_file]
+      assert_equal ChatAnalyst::Ids.escape_path(jobs_file), entry['jobs_file']
       # the parent's own chat is still the provenance-sourced entry
-      assert_equal :provenance, result[:chats].detect { |c| c[:path] == save_file }[:source]
-      assert_equal :provenance, result[:source]
+      parent_row = row_for(result, ChatAnalyst::Ids.chat_id(save_file))
+      assert_equal 'provenance', parent_row['source']
+      assert_equal '\\N', parent_row['jobs_file']
     end
   end
 
@@ -291,9 +304,10 @@ class TestInboxTasks < Test::Unit::TestCase
       assert_no_match(/\n\z/, Open.read(jobs_file), 'writer emits no trailing newline')
 
       result = ChatAnalyst.job(:live_chats, fresh_id('nl'), {file: chat}).run
-      paths = result[:chats].collect { |c| c[:path] }
+      paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
       assert paths.include?(File.join(child_files, 'worker.chat'))
-      assert_equal :jobs, result[:chats].detect { |c| c[:path].end_with?('worker.chat') }[:source]
+      worker_key = result.keys.detect { |k| k.end_with?('worker.chat') }
+      assert_equal 'jobs', row_for(result, worker_key)['source']
     end
   end
 
@@ -318,15 +332,15 @@ class TestInboxTasks < Test::Unit::TestCase
       write_jobs_file(File.join(grand_files, 'grand.chat'), [deep_short])
 
       result = ChatAnalyst.job(:live_chats, fresh_id('depth'), {file: job}).run
-      paths = result[:chats].collect { |c| c[:path] }
+      paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
 
       assert paths.include?(File.join(child_files, 'child_agent.chat')), 'depth 1 not followed'
       assert paths.include?(File.join(grand_files, 'grand.chat')), 'jobs-of-jobs (depth 2) not followed'
       assert !paths.include?(File.join(deep_files, 'deep.chat')), 'depth 3 must not be followed'
 
-      jobs_entries = result[:chats].select { |c| c[:source] == :jobs }
-      assert_equal 2, jobs_entries.length
-      assert jobs_entries.all? { |c| c[:jobs_file].end_with?('.jobs') }
+      jobs_keys = result.keys.select { |k| row_for(result, k)['source'] == 'jobs' }
+      assert_equal 2, jobs_keys.length
+      assert jobs_keys.all? { |k| ChatAnalyst::Ids.unescape_path(row_for(result, k)['jobs_file']).end_with?('.jobs') }
     end
   end
 
@@ -349,7 +363,7 @@ class TestInboxTasks < Test::Unit::TestCase
       jobs_file = write_jobs_file(save_file, [good_short, missing_short, broken_short])
 
       result = ChatAnalyst.job(:live_chats, fresh_id('broken'), {file: job}).run
-      paths = result[:chats].collect { |c| c[:path] }
+      paths = result.keys.collect { |k| ChatAnalyst::Ids.unescape_path(k) }
       assert paths.include?(File.join(good_files, 'good.chat')), 'good reference must survive'
       assert paths.none? { |p| p.include?('ghost') }, 'missing job dir must be skipped'
       assert paths.none? { |p| p.include?('Default_bare') }, 'non-candidate step must be skipped'
@@ -358,7 +372,7 @@ class TestInboxTasks < Test::Unit::TestCase
       # transient: removed in the ensure after Workflow.produce)
       File.delete(jobs_file)
       result2 = ChatAnalyst.job(:live_chats, fresh_id('vanished'), {file: job}).run
-      assert result2[:chats].none? { |c| c[:source] == :jobs }
+      assert result2.keys.none? { |k| row_for(result2, k)['source'] == 'jobs' }
     end
   end
 
@@ -374,9 +388,9 @@ class TestInboxTasks < Test::Unit::TestCase
       write_jobs_file(society_chat, [child_short])
 
       result = ChatAnalyst.job(:live_chats, fresh_id('glob-seed'), {file: job}).run
-      entry = result[:chats].detect { |c| c[:path].end_with?('globbed.chat') }
-      assert_not_nil entry, 'child of a society chat delegation not found'
-      assert_equal :jobs, entry[:source]
+      key = result.keys.detect { |k| k.end_with?('globbed.chat') }
+      assert_not_nil key, 'child of a society chat delegation not found'
+      assert_equal 'jobs', row_for(result, key)['source']
     end
   end
 
@@ -402,39 +416,80 @@ class TestInboxTasks < Test::Unit::TestCase
 
       result = ChatAnalyst.job(:live_chats, fresh_id('precedence'), {file: job}).run
 
-      dup_chat = File.join(child_files, 'dup.chat')
-      matches = result[:chats].select { |c| c[:path] == dup_chat }
-      assert_equal 1, matches.length, 'the same chat must not be reported twice'
-      assert_equal :provenance, matches.first[:source],
+      dup_key = ChatAnalyst::Ids.chat_id(File.join(child_files, 'dup.chat'))
+      assert result.keys.count(dup_key) == 1, 'the same chat must not be reported twice'
+      assert_equal 'provenance', row_for(result, dup_key)['source'],
                    'a chat found by traversal is not duplicated as :jobs'
-      assert result[:chats].collect { |c| c[:path] } ==
-             result[:chats].collect { |c| c[:path] }.uniq
+      assert_equal result.keys.length, result.keys.uniq.length
     end
   end
 
   # --- inbox_state ------------------------------------------------------
 
-  def test_inbox_state_lists_pending_and_delivered_with_content
+  def test_inbox_state_is_an_index_without_bodies
     chat = fixture_chat_with_inbox
     state = ChatAnalyst.job(:inbox_state, {file: chat}).run
 
-    assert_equal chat, state[:save_file]
-    assert_equal chat + '.files', state[:files_dir]
-    # sibling scheme, derived by the sanctioned scout-ai helpers
-    assert_equal Chat.inbox_dir(chat), state[:inbox_dir]
-    assert_equal Chat.inbox_removed_dir(chat), state[:inbox_removed_dir]
-    # for a top-level save_file `parent.chat` the sibling inbox is
-    # `parent.inbox`, in the SAME directory (not under .files)
-    assert_equal File.join(@dir, 'parent.inbox'), state[:inbox_dir]
-    assert_equal File.join(@dir, 'parent.inbox_removed'), state[:inbox_removed_dir]
+    assert_equal 'Note', state.key_field
+    assert_equal %w[state name mtime size], state.fields
+    assert_nil state.options[:cast]
 
-    assert_equal ['a.md'], state[:pending].collect { |n| n[:name] }
-    assert_equal 'advice A', state[:pending].first[:content]
-    assert_equal 8, state[:pending].first[:size]
-    assert_not_nil Time.parse(state[:pending].first[:mtime])
+    # keys are the absolute ESCAPED note paths; root_path carries the
+    # escaped save file
+    assert_equal ChatAnalyst::Ids.escape_path(chat), state.root_path
+    pending_key = ChatAnalyst::Ids.escape_path(File.join(Chat.inbox_dir(chat), 'a.md'))
+    delivered_key = ChatAnalyst::Ids.escape_path(File.join(Chat.inbox_removed_dir(chat), 'old.md'))
+    assert state.keys.include?(pending_key)
+    assert state.keys.include?(delivered_key)
 
-    assert_equal ['old.md'], state[:delivered].collect { |n| n[:name] }
-    assert_equal 'old advice', state[:delivered].first[:content]
+    pending = row_for(state, pending_key)
+    assert_equal 'pending', pending['state']
+    assert_equal 'a.md', pending['name']
+    assert_equal 8, pending['size'].to_i
+    assert Time.parse(pending['mtime'])
+    assert pending['mtime'].match?(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\z/)
+
+    delivered = row_for(state, delivered_key)
+    assert_equal 'delivered', delivered['state']
+    assert_equal 'old.md', delivered['name']
+
+    # PIN (phase-3 behavior change): no note bodies anywhere in the table.
+    # The bodies live in inbox_note now; the index never embeds them.
+    assert state.to_s !~ /advice A/, 'pending body must not be embedded'
+    assert state.to_s !~ /old advice/, 'delivered body must not be embedded'
+  end
+
+  def test_inbox_note_reads_bodies_and_round_trips
+    chat = fixture_chat_with_inbox
+    # pending body
+    assert_equal 'advice A', ChatAnalyst.job(:inbox_note, {file: chat, name: 'a.md'}).run
+    # delivered body
+    assert_equal 'old advice', ChatAnalyst.job(:inbox_note, {file: chat, name: 'old.md'}).run
+
+    # a posted note round-trips through the index + point read
+    posted = ChatAnalyst.job(:post_inbox_advice,
+                             {file: chat, message: 'round trip body', name: 'rt.md'}).run
+    state = ChatAnalyst.job(:inbox_state, fresh_id('rt-index'), {file: chat}).run
+    assert_equal ['rt.md'], state.keys.collect { |k| row_for(state, k)['name'] }
+                              .select { |n| n == 'rt.md' }
+    assert_equal 'round trip body', ChatAnalyst.job(:inbox_note, {file: chat, name: 'rt.md'}).run
+
+    # error behaviour: missing note, path-like name, empty name
+    assert_raise(ParameterException) do
+      ChatAnalyst.job(:inbox_note, {file: chat, name: 'nope.md'}).run
+    end
+    assert_raise(ParameterException) do
+      ChatAnalyst.job(:inbox_note, {file: chat, name: 'a/b.md'}).run
+    end
+    assert_raise(ParameterException) do
+      ChatAnalyst.job(:inbox_note, {file: chat, name: '  '}).run
+    end
+    # a job root is rejected (point read of a chat save file's inbox)
+    job = fixture_job_root
+    assert_raise(ParameterException) do
+      ChatAnalyst.job(:inbox_note, {file: job, name: 'a.md'}).run
+    end
+    posted
   end
 
   def test_inbox_state_per_save_file_inboxes_in_a_shared_files_dir
@@ -452,9 +507,12 @@ class TestInboxTasks < Test::Unit::TestCase
     agent_state = ChatAnalyst.job(:inbox_state, fresh_id('agent'), {file: agent}).run
     worker_state = ChatAnalyst.job(:inbox_state, fresh_id('worker'), {file: worker}).run
 
-    assert_equal ['only-agent.md'], agent_state[:pending].collect { |n| n[:name] }
-    assert_equal ['for agent'], agent_state[:pending].collect { |n| n[:content] }
-    assert_equal ['only-worker.md'], worker_state[:pending].collect { |n| n[:name] }
+    agent_names = agent_state.keys.collect { |k| row_for(agent_state, k)['name'] }
+    worker_names = worker_state.keys.collect { |k| row_for(worker_state, k)['name'] }
+    assert_equal ['only-agent.md'], agent_names
+    assert_equal ['only-worker.md'], worker_names
+    assert_equal 'for agent',
+                 ChatAnalyst.job(:inbox_note, {file: agent, name: 'only-agent.md'}).run
   end
 
   def test_inbox_state_multi_dot_and_extensionless_save_files
@@ -464,9 +522,8 @@ class TestInboxTasks < Test::Unit::TestCase
     File.write(File.join(@dir, 'a.b.inbox', 'n.md').tap { |p| FileUtils.mkdir_p(File.dirname(p)) }, 'multi')
 
     state = ChatAnalyst.job(:inbox_state, {file: multi}).run
-    assert_equal File.join(@dir, 'a.b.inbox'), state[:inbox_dir]
-    assert_equal File.join(@dir, 'a.b.inbox_removed'), state[:inbox_removed_dir]
-    assert_equal ['n.md'], state[:pending].collect { |n| n[:name] }
+    assert state.keys.include?(ChatAnalyst::Ids.escape_path(File.join(@dir, 'a.b.inbox', 'n.md')))
+    assert_equal ['n.md'], state.keys.collect { |k| row_for(state, k)['name'] }
   end
 
   def test_inbox_state_missing_directories_are_empty
@@ -474,9 +531,8 @@ class TestInboxTasks < Test::Unit::TestCase
     File.write(chat, "user: l\n")
     state = ChatAnalyst.job(:inbox_state, {file: chat}).run
 
-    assert_empty state[:pending]
-    assert_empty state[:delivered]
-    assert_equal Chat.inbox_dir(chat), state[:inbox_dir]
+    assert_empty state.keys
+    assert_equal 0, state.total
   end
 
   def test_inbox_state_rejects_job_root
@@ -495,13 +551,13 @@ class TestInboxTasks < Test::Unit::TestCase
 
     $inbox_race_armed = true
     ChatAnalyst.step_module.prepend(Module.new do
-      define_method(:inbox_entry) do |path|
+      define_method(:inbox_note_row) do |path, state|
         # simulate the consumer picking the second file up while the first
         # is being read (glob order is a.md, then race-*.md sorted after);
         # armed only inside this test so the prepend is inert afterwards
         target = File.join(File.dirname(path), 'z-vanishing.md')
         File.delete(target) if $inbox_race_armed && File.exist?(target)
-        super(path)
+        super(path, state)
       end
     end)
 
@@ -512,7 +568,9 @@ class TestInboxTasks < Test::Unit::TestCase
       $inbox_race_armed = false
     end
 
-    assert_equal ['a.md'], state[:pending].collect { |n| n[:name] },
+    pending_names = state.keys.collect { |k| row_for(state, k)['name'] }
+                          .select { |name| row_for(state, state.keys.detect { |kk| row_for(state, kk)['name'] == name })['state'] == 'pending' }
+    assert_equal ['a.md'], pending_names,
                   'the vanished note is skipped, not reported and not fatal'
   end
 
@@ -523,23 +581,33 @@ class TestInboxTasks < Test::Unit::TestCase
     posted = ChatAnalyst.job(:post_inbox_advice,
                              {file: chat, message: 'check the temp files', name: 'n1.md'}).run
 
+    assert_equal 'Posted', posted.key_field
+    assert_equal %w[name save_file inbox_dir size], posted.fields
+    assert_equal 1, posted.total
+
     target = File.join(Chat.inbox_dir(chat), 'n1.md')
-    assert_equal target, posted[:posted]
+    assert_equal [ChatAnalyst::Ids.escape_path(target)], posted.keys
+    row = row_for(posted, posted.keys.first)
+    assert_equal 'n1.md', row['name']
+    assert_equal ChatAnalyst::Ids.escape_path(chat), row['save_file']
+    assert_equal ChatAnalyst::Ids.escape_path(Chat.inbox_dir(chat)), row['inbox_dir']
+    assert_equal 'check the temp files'.length.to_s, row['size']
     assert File.file?(target)
     assert_equal 'check the temp files', Open.read(target)
 
     state = ChatAnalyst.job(:inbox_state, fresh_id('after-post'), {file: chat}).run
-    names = state[:pending].collect { |n| n[:name] }
+    names = state.keys.collect { |k| row_for(state, k)['name'] }
     assert names.include?('n1.md')
     assert_equal 'check the temp files',
-                 state[:pending].detect { |n| n[:name] == 'n1.md' }[:content]
+                 ChatAnalyst.job(:inbox_note, {file: chat, name: 'n1.md'}).run
   end
 
   def test_post_default_name_is_timestamped
     chat = fixture_chat_with_inbox
     posted = ChatAnalyst.job(:post_inbox_advice, {file: chat, message: 'auto named'}).run
-    assert_match(/\A\d{8}-\d{6}-advice\.md\z/, posted[:name])
-    assert File.file?(File.join(Chat.inbox_dir(chat), posted[:name]))
+    name = row_for(posted, posted.keys.first)['name']
+    assert_match(/\A\d{8}-\d{6}-advice\.md\z/, name)
+    assert File.file?(File.join(Chat.inbox_dir(chat), name))
   end
 
   def test_post_rejects_bad_inputs
@@ -580,10 +648,11 @@ class TestInboxTasks < Test::Unit::TestCase
 
     posted = ChatAnalyst.job(:post_inbox_advice,
                              {file: agent, message: 'watch the glob', name: 'note.md'}).run
-    assert_equal File.join(files, 'agent.inbox', 'note.md'), posted[:posted]
+    assert_equal [ChatAnalyst::Ids.escape_path(File.join(files, 'agent.inbox', 'note.md'))],
+                 posted.keys
 
     state = ChatAnalyst.job(:inbox_state, fresh_id('sidecar'), {file: agent}).run
-    assert_equal ['note.md'], state[:pending].collect { |n| n[:name] }
+    assert_equal ['note.md'], state.keys.collect { |k| row_for(state, k)['name'] }
   end
 
   # --- end to end against scout-ai itself -------------------------------
@@ -594,10 +663,11 @@ class TestInboxTasks < Test::Unit::TestCase
 
     advice = 'stop repeating the same probe; check the save_file shape'
     posted = ChatAnalyst.job(:post_inbox_advice, {file: chat, message: advice}).run
+    posted_name = row_for(posted, posted.keys.first)['name']
 
     # still pending before the real inference
     before = ChatAnalyst.job(:inbox_state, fresh_id('before'), {file: chat}).run
-    assert_equal [posted[:name]], before[:pending].collect { |n| n[:name] }
+    assert_equal [posted_name], before.keys.collect { |k| row_for(before, k)['name'] }
 
     # the strategy: same call scout-ai makes on every real inference
     prepared = Chat.inbox([{role: 'user', content: 'x'}], save_file: chat)
@@ -608,15 +678,16 @@ class TestInboxTasks < Test::Unit::TestCase
     assert_equal 'x', prepared.first[:content]
 
     # the note moved into the sibling .inbox_removed (delivery record, name kept)
-    assert !File.exist?(File.join(Chat.inbox_dir(chat), posted[:name]))
-    removed = File.join(Chat.inbox_removed_dir(chat), posted[:name])
+    assert !File.exist?(File.join(Chat.inbox_dir(chat), posted_name))
+    removed = File.join(Chat.inbox_removed_dir(chat), posted_name)
     assert File.file?(removed)
     assert_equal advice, Open.read(removed)
 
     after = ChatAnalyst.job(:inbox_state, fresh_id('after'), {file: chat}).run
-    assert_empty after[:pending]
-    assert_equal [posted[:name]], after[:delivered].collect { |n| n[:name] }
-    assert_equal advice, after[:delivered].first[:content]
+    after_states = after.keys.collect { |k| row_for(after, k)['state'] }
+    assert_empty after_states & ['pending']
+    assert_equal [posted_name], after.keys.collect { |k| row_for(after, k)['name'] }
+    assert_equal advice, ChatAnalyst.job(:inbox_note, {file: chat, name: posted_name}).run
 
     # consume-once: a second real inference appends nothing new
     second = Chat.inbox([{role: 'user', content: 'y'}], save_file: chat)
@@ -658,7 +729,7 @@ class TestInboxTasks < Test::Unit::TestCase
     assert_equal 'sidecar advice', Open.read(removed)
 
     state = ChatAnalyst.job(:inbox_state, fresh_id('e2e-sidecar'), {file: agent}).run
-    assert_empty state[:pending]
-    assert_equal ['s.md'], state[:delivered].collect { |n| n[:name] }
+    assert_empty state.keys.collect { |k| row_for(state, k)['state'] } & ['pending']
+    assert_equal ['s.md'], state.keys.collect { |k| row_for(state, k)['name'] }
   end
 end

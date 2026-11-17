@@ -49,14 +49,25 @@ class TestUnresolvedJobsNeverNil < Test::Unit::TestCase
     end
   end
 
-  # The no-nil invariant survives on the TASK surface too (chat_tokens
-  # attribution view), not only the module method.
+  # Phase 3 (contract 2E): the chat_tokens attribution VIEW moved to the
+  # chat_attribution task, and the linked/unresolved job lists are NOT cells
+  # there (settled simplification, recorded in the contract).  The no-nil
+  # invariant this suite pins survives on ChatAnalyst.attribution above; the
+  # task-surface pin now covers chat_attribution's bucket rows and the
+  # retired attribution input being ignored by the job layer.
   def test_chat_tokens_attribution_view_reports_no_nil
     Dir.mktmpdir do |dir|
       parent, ghost = fixture_cortex_continue_missing(dir)
-      view = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run[:attribution]
-      assert_equal [ghost], view[:unresolved_jobs]
-      assert view[:unresolved_jobs].none?(&:nil?)
+      summary = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
+      assert_equal 'Scope', summary.key_field, 'unknown input ignored: summary table'
+      assert_equal 4, summary.length
+
+      buckets = ChatAnalyst.job(:chat_attribution, {file: parent}).run
+      assert_equal 'Bucket', buckets.key_field
+      assert_equal %w[delegated root unattributed], buckets.keys.sort
+      assert_equal '0', buckets['unattributed'][2]
+      # the no-nil source invariant still holds on the module surface
+      assert_equal [ghost], ChatAnalyst.attribution(parent)[:unresolved_jobs]
     end
   end
 

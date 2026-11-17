@@ -26,27 +26,32 @@ class TestChatAnalystTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent, worker = parent_with_job(dir)
       result = ChatAnalyst.job(:chat_overview, {file: parent}).run
-      assert_equal parent, result[:root][:path]
-      assert result[:jobs].any? { |job| job[:path] == worker }
-      JSON.parse(result.to_json) # plain serializable data only
+      # Phase 3 TSV surface: one row per chat, annotations on the #: line
+      assert_equal 1, result.length
+      row = result[result.keys.first]
+      assert_equal '5', row['messages']
+      assert_equal '2', row['references']
+      assert result.keys.first.include?('parent.chat')
+      assert result.options[:root_path]
+      assert result.options[:total] == 1
+      assert result.options[:chats] == 1
+      assert result.options[:jobs] == 1
+      assert result.options[:delegations] == 1
     end
   end
 
-  def test_chat_timeline_task_returns_bouts
-    Dir.mktmpdir do |dir|
-      parent, _worker = parent_with_job(dir)
-      result = ChatAnalyst.job(:chat_timeline, {file: parent}).run
-      assert result[:bouts].any?
-      assert result[:summary][:chats] >= 1
-    end
-  end
+  # chat_timeline was retired in phase 3 bout 4 (snapshot:
+  # var/baselines/phase3-removed/chat_timeline.rb) - the temporal surface is
+  # chat_activity_clusters/chat_inferences/chat_activity_cluster, pinned in
+  # test/test_phase3_temporal_tasks.rb.
 
   def test_chat_messages_task_indexes_one_chat
     Dir.mktmpdir do |dir|
       parent, _worker = parent_with_job(dir)
       result = ChatAnalyst.job(:chat_messages, {file: parent}).run
       assert result.length >= 4
-      assert result.all? { |message| message.key?(:index) }
+      assert result.all? { |_key, row| row.length == 4 }
+      assert result.keys.first.end_with?('#0')
     end
   end
 
@@ -54,9 +59,10 @@ class TestChatAnalystTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent, _worker = parent_with_job(dir)
       result = ChatAnalyst.job(:chat_range, {file: parent, first: 0, last: 1}).run
-      assert_equal 0, result[:first]
-      assert_equal 1, result[:last]
-      assert_equal 2, result[:messages].length
+      # :chat output: the byte-exact persisted slice; parse back to compare
+      reloaded = Chat.parse(result)
+      assert_equal 2, reloaded.length
+      assert_equal 'Run the worker', reloaded.first[:content]
     end
   end
 
@@ -64,8 +70,8 @@ class TestChatAnalystTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent, _worker = parent_with_job(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: parent}).run
-      assert result[:calls].length >= 1
-      assert result[:calls].first[:tool]
+      assert result.length >= 1
+      assert result.values.first[1], 'tool column present'
     end
   end
 
@@ -73,7 +79,8 @@ class TestChatAnalystTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent, _worker = parent_with_job(dir)
       result = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert result[:scopes][:deduplicated_total][:tt] >= 151
+      assert_equal 'Scope', result.key_field
+      assert Integer(result['deduplicated_total'][2]) >= 151, 'deduplicated_total tt (native Integer under :to_i cast)'
     end
   end
 
@@ -107,8 +114,8 @@ class TestChatAnalystTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent, _worker = parent_with_job(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: parent, dedupe: true}).run
-      assert result.key?(:total)
-      assert result.key?(:calls)
+      assert_equal 'ToolCall', result.key_field
+      assert result.total >= 1, 'raw total annotation'
     end
   end
 
@@ -125,8 +132,9 @@ class TestChatAnalystTasks < Test::Unit::TestCase
 
   def test_retired_tasks_are_gone
     %i[chat_agents meta_evidence chat_reasoning provenance_relationships
-       message_index message_content extract_chat_range chat_report].each do |name|
-      refute ChatAnalyst.tasks.key?(name), "#{name} should have been retired (Phase C / phase 2)"
+       message_index message_content extract_chat_range chat_report
+       chat_timeline].each do |name|
+      refute ChatAnalyst.tasks.key?(name), "#{name} should have been retired (Phase C / phase 2 / phase 3)"
     end
   end
 end

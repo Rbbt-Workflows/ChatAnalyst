@@ -97,9 +97,18 @@ class TestProvenanceRelationships < Test::Unit::TestCase
       assert_equal :import, ref[:type]
       refute ref[:resolved]
       assert_equal :missing, ref[:unresolved_reason]
-      # own-scope accounting still works on the importing chat
+      # own-scope accounting still works on the importing chat (phase-3
+      # TSV: one row keyed by the chat, imports multi-value cell)
       accounting = ChatAnalyst.job(:chat_accounting, {file: chat}).run
-      assert_equal 1, accounting[:entries].length
+      assert_equal 1, accounting.keys.length
+      assert_equal 'own', accounting.scope
+      assert_equal 'Chat', accounting.key_field
+      row = accounting[accounting.keys.first]
+      # unresolved_imports carries the unresolved REFERENCE text; imports
+      # carries resolved targets only, so a missing import contributes a
+      # null imports cell and its reference text in unresolved_imports.
+      assert_equal ['nope.chat'], row['unresolved_imports'].split('|')
+      assert_equal '\\N', row['imports']
     end
   end
 
@@ -107,24 +116,30 @@ class TestProvenanceRelationships < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       base, middle, top = import_chain(dir)
       result = ChatAnalyst.job(:chat_accounting, {file: top, scope: 'own'}).run
-      assert_equal :own, result[:scope]
-      assert_equal 3, result[:entries].length
-      by_name = result[:entries].to_h { |e| [File.basename(e[:chat]), e] }
+      assert_equal 'own', result.scope
+      assert_equal 3, result.keys.length
+      assert_nil result.options[:cast], 'mixed table: no native cast'
+      by_name = result.keys.to_h do |key|
+        row = result[key]
+        [File.basename(ChatAnalyst::Ids.unescape_path(key)), row]
+      end
 
       own_top = by_name['top.chat']
-      assert_equal 2, own_top[:tokens][:tt]
-      assert own_top[:imports].any? { |i| i.end_with?('middle.chat') }
+      assert_equal 2, own_top['tt'].to_i
+      assert own_top['imports'].split('|').any? { |i| ChatAnalyst::Ids.unescape_path(i).end_with?('middle.chat') }
 
       own_middle = by_name['middle.chat']
-      assert_equal 30, own_middle[:tokens][:tt]
+      assert_equal 30, own_middle['tt'].to_i
 
       own_base = by_name['base.chat']
-      assert_equal 15, own_base[:tokens][:tt]
+      assert_equal 15, own_base['tt'].to_i
 
       # no double counting: sum of own totals equals the closure total
       closure = ChatAnalyst.job(:chat_accounting, {file: top, scope: 'closure'}).run
-      own_sum = result[:entries].sum { |e| e[:tokens][:tt] }
-      assert_equal closure[:entries].first[:tokens][:tt], own_sum
+      own_sum = result.keys.sum { |key| result[key]['tt'].to_i }
+      assert_equal closure[closure.keys.first]['tt'].to_i, own_sum
+      assert_equal 'closure', closure.scope
+      assert_equal 1, closure.keys.length
     end
   end
 
@@ -132,6 +147,8 @@ class TestProvenanceRelationships < Test::Unit::TestCase
   # memo-distinguishes-follow): `follow` no longer exists anywhere in the
   # exported surface; chat_overview always traverses references and direct
   # dependencies, and an unknown task input is rejected by the framework.
+  # Phase 3: chat_overview is the per-CHAT TSV table; the JOB universe moved
+  # to job_overview (one row per job node).  Both are asserted here.
   def test_follow_is_gone_and_overview_always_traverses
     Dir.mktmpdir do |dir|
       dep = make_job(dir, 'D/load/Default_1')
@@ -143,11 +160,12 @@ class TestProvenanceRelationships < Test::Unit::TestCase
                         "meta: job=#{job}\n" \
                         "assistant: a\n")
       result = ChatAnalyst.job(:chat_overview, {file: chat}).run
-      job_paths = result[:jobs].collect { |j| j[:path] }
+      jobs = ChatAnalyst.job(:job_overview, {file: chat}).run
+      job_paths = jobs.keys.collect { |key| ChatAnalyst::Ids.unescape_path(key) }
       assert job_paths.any? { |p| p.end_with?('W/ask/Default_w') }
       assert job_paths.any? { |p| p.end_with?('D/load/Default_1') },
              "direct dependency not traversed: #{job_paths.inspect}"
-      assert job_paths.none? { |p| p.end_with?('agent.chat') },
+      assert result.keys.none? { |k| k.end_with?('agent.chat') },
              'log chats are listed per job, never traversed as chats'
       refute ChatAnalyst.tasks[:chat_overview].inputs.collect { |input| input.first.to_s }.include?('follow'),
              'follow input still present on chat_overview'

@@ -201,13 +201,13 @@ module ChatAnalyst
     path = canonical_chat_path(chat_path)
     valid = "0..#{chat.length - 1}"
     unless Integer === first && first >= 0
-      raise ArgumentError, "Invalid range start #{first.inspect} for #{path}: must be a non-negative integer (valid range #{valid})"
+      raise ParameterException, "Invalid range start #{first.inspect} for #{path}: must be a non-negative integer (valid range #{valid})"
     end
     unless Integer === last && last >= first
-      raise ArgumentError, "Invalid range end #{last.inspect} for #{path}: must be an integer >= first (#{first}); valid range #{valid}"
+      raise ParameterException, "Invalid range end #{last.inspect} for #{path}: must be an integer >= first (#{first}); valid range #{valid}"
     end
     if last >= chat.length
-      raise ArgumentError, "Range #{first}..#{last} out of range for #{path}: valid range #{valid} (#{chat.length} messages)"
+      raise ParameterException, "Range #{first}..#{last} out of range for #{path}: valid range #{valid} (#{chat.length} messages)"
     end
 
     messages = first.upto(last).collect { |i| message_record(nil, chat, i) }
@@ -252,14 +252,14 @@ module ChatAnalyst
   # ids the selected bursts are returned with their bout records inlined.
   def self.timeline(root, bursts: [], burst_gap: 120)
     unless Numeric === burst_gap && burst_gap > 0
-      raise ArgumentError, "Invalid burst_gap #{burst_gap.inspect}: must be a positive number of seconds"
+      raise ParameterException, "Invalid burst_gap #{burst_gap.inspect}: must be a positive number of seconds"
     end
     requested = Array(bursts)
     selected = requested.collect do |id|
       Integer === id ? id : (String === id && id =~ /\A[1-9]\d*\z/ ? id.to_i : nil)
     end
     invalid = requested.zip(selected).reject { |_raw, normalized| normalized }.map(&:first)
-    raise ArgumentError, "Invalid burst ids #{invalid.inspect}: burst ids are 1-based integers" unless invalid.empty?
+    raise ParameterException, "Invalid burst ids #{invalid.inspect}: burst ids are 1-based integers" unless invalid.empty?
     selected = selected.compact.uniq.sort
 
     root_kind, root_value = resolve_api_root(root, nil)
@@ -324,18 +324,18 @@ module ChatAnalyst
     valid = "0..#{chat.length - 1}"
     first = 0 if first.nil?
     unless Integer === first && first >= 0
-      raise ArgumentError, "Invalid first #{first.inspect} for #{path}: must be a non-negative integer (valid range #{valid})"
+      raise ParameterException, "Invalid first #{first.inspect} for #{path}: must be a non-negative integer (valid range #{valid})"
     end
     last = chat.length - 1 if last.nil?
     unless Integer === last && last >= first
-      raise ArgumentError, "Invalid last #{last.inspect} for #{path}: must be an integer >= first (#{first}); valid range #{valid}"
+      raise ParameterException, "Invalid last #{last.inspect} for #{path}: must be an integer >= first (#{first}); valid range #{valid}"
     end
     if last >= chat.length
-      raise ArgumentError, "Range #{first}..#{last} out of range for #{path}: valid range #{valid} (#{chat.length} messages)"
+      raise ParameterException, "Range #{first}..#{last} out of range for #{path}: valid range #{valid} (#{chat.length} messages)"
     end
 
     graph = Chat.provenance_graph(path, root_type: :chat)
-    records = timeline_call_records(chat, graph)
+    records = timeline_call_records(chat, graph, path)
       .select { |call| Integer === call[:call_index] && call[:call_index] >= first && call[:call_index] <= last }
     {chat: path, first: first, last: last, calls: records}
   end
@@ -360,22 +360,22 @@ module ChatAnalyst
     path = canonical_chat_path(chat_path)
     valid = "0..#{chat.length - 1}"
     unless Integer === call_index && call_index >= 0
-      raise ArgumentError, "Invalid call index #{call_index.inspect} for #{path}: must be a non-negative integer (valid range #{valid})"
+      raise ParameterException, "Invalid call index #{call_index.inspect} for #{path}: must be a non-negative integer (valid range #{valid})"
     end
     if call_index >= chat.length
-      raise ArgumentError, "Call index #{call_index} out of range for #{path}: valid range #{valid} (#{chat.length} messages)"
+      raise ParameterException, "Call index #{call_index} out of range for #{path}: valid range #{valid} (#{chat.length} messages)"
     end
 
     parsed = Chat.tool_calls(chat)
     call = parsed.find { |entry| entry[:call_index] == call_index }
     unless call
       started = parsed.collect { |entry| entry[:call_index] }.compact
-      raise ArgumentError,
+      raise ParameterException,
             "No tool call starts at index #{call_index} of #{path}: the message at that index is not a function_call/mcp_call start. Tool calls start at #{started.inspect}"
     end
 
     graph = Chat.provenance_graph(path, root_type: :chat)
-    compact = timeline_call_records(chat, graph)
+    compact = timeline_call_records(chat, graph, path)
       .find { |record| record[:call_index] == call_index }
 
     arguments = call[:arguments]
@@ -411,6 +411,12 @@ module ChatAnalyst
     record[:output_info] = output_info.except('content') if output_info.any?
     record[:delegation_target] = compact[:delegation_target] if compact && compact[:delegation_target]
     record[:copy_of] = compact[:copy_of] if compact && compact.key?(:copy_of)
+    record[:inference_id] = compact[:inference_id] if compact
+    record[:source_kind] = compact ? compact[:source_kind] : nil
+    if compact && compact[:target_agent]
+      record[:target_agent] = compact[:target_agent]
+      record[:target_conversation] = compact[:target_conversation]
+    end
     record
   end
 
@@ -481,7 +487,7 @@ module ChatAnalyst
   # last), cycle-safe.
   def self.relationships(chat_path)
     path = canonical_chat_path(chat_path)
-    raise ArgumentError, "Chat not found: #{chat_path}" unless File.file?(path)
+    raise ParameterException, "Chat not found: #{chat_path}" unless File.file?(path)
 
     references = relationship_references(path)
     by_target = references.group_by { |reference| reference[:target] || reference[:reference] }
@@ -674,15 +680,15 @@ module ChatAnalyst
   def self.resolve_api_root(root, root_type = nil)
     if root_type
       kind = root_type.to_sym
-      raise ArgumentError, "Unknown root type: #{root_type.inspect} (use :chat or :job)" unless %i[chat job].include?(kind)
+      raise ParameterException, "Unknown root type: #{root_type.inspect} (use :chat or :job)" unless %i[chat job].include?(kind)
       if kind == :job
         step = Step === root ? root : Step.load(File.expand_path(root.to_s))
         path = step.path.to_s
-        raise ArgumentError, "Job not found: #{root}" unless File.exist?(path) || File.exist?(path + '.info')
+        raise ParameterException, "Job not found: #{root}" unless File.exist?(path) || File.exist?(path + '.info')
         return [:job, step]
       end
       path = File.expand_path(root.to_s)
-      raise ArgumentError, "Chat not found: #{root}" unless File.file?(path)
+      raise ParameterException, "Chat not found: #{root}" unless File.file?(path)
       return [:chat, path]
     end
 
@@ -693,7 +699,7 @@ module ChatAnalyst
     rescue StandardError
     end
     candidate = candidates.compact.find { |c| File.file?(c.to_s) }
-    raise ArgumentError, "Chat or job not found: #{root}" unless candidate
+    raise ParameterException, "Chat or job not found: #{root}" unless candidate
 
     path = File.expand_path(candidate.to_s)
     File.exist?(path + '.info') ? [:job, Step.load(path)] : [:chat, path]
@@ -789,7 +795,7 @@ module ChatAnalyst
 
   def self.load_single_chat(chat_path)
     path = File.expand_path(chat_path.to_s)
-    raise ArgumentError, "Chat not found: #{chat_path}" unless File.file?(path)
+    raise ParameterException, "Chat not found: #{chat_path}" unless File.file?(path)
     Chat.load(path)
   end
 
@@ -804,10 +810,10 @@ module ChatAnalyst
   def self.check_message_index!(chat_path, chat, index)
     valid = "0..#{chat.length - 1}"
     unless Integer === index && index >= 0
-      raise ArgumentError, "Invalid message index #{index.inspect} for #{File.expand_path(chat_path.to_s)}: indices are zero-based and must be non-negative (valid range #{valid})"
+      raise ParameterException, "Invalid message index #{index.inspect} for #{File.expand_path(chat_path.to_s)}: indices are zero-based and must be non-negative (valid range #{valid})"
     end
     if index >= chat.length
-      raise ArgumentError, "Message index #{index} out of range for #{File.expand_path(chat_path.to_s)}: valid range #{valid} (#{chat.length} messages)"
+      raise ParameterException, "Message index #{index} out of range for #{File.expand_path(chat_path.to_s)}: valid range #{valid} (#{chat.length} messages)"
     end
   end
 
@@ -1189,16 +1195,23 @@ module ChatAnalyst
 
   # Compact per-call records shared by timeline bouts and tool_calls: never
   # arguments, never outputs, never error text.
-  def self.timeline_call_records(chat, graph)
+  # +inference_chat_path+ (optional, the chat's canonical path) enables the
+  # inference_id foreign key: each call is owned by the LAST inference meta
+  # BEFORE it in the same chat (the pinned EMITTER rule - scout-ai unshifts
+  # the meta before its response segment; a call with no preceding inference
+  # meta is unassociated, nil).
+  def self.timeline_call_records(chat, graph, inference_chat_path = nil)
     delegation = graph[:delegation]
     receipts = Chat.agent_meta_evidence(chat).group_by { |record| record[:call_id] }
     parsed = Chat.tool_calls(chat)
+    owners = inference_chat_path ? inference_owner_map(chat) : {}
     records = parsed.collect do |call|
       status = Chat.tool_call_status(call)
       output_info = Hash === call[:output_info] ? call[:output_info] : {}
       target = delegation[call[:call_index]] || timeline_arguments_delegation_target(call)
       receipt_delegation = receipts[call[:call_id]].to_a.any?
-      {
+      owner_index = owners[call[:call_index]]
+      record = {
         tool: call[:name].to_s,
         call_id: call[:call_id],
         call_index: call[:call_index],
@@ -1213,6 +1226,17 @@ module ChatAnalyst
         delegation_target: target,
         jobs: timeline_refs_at(graph[:chats], call[:output_index]) || []
       }
+      # Inference fields are attached ONLY when the owning chat path is given:
+      # the timeline passes none, so timeline()/chat_timeline records keep
+      # their exact pre-phase-3 shape (no behavior change there).
+      if inference_chat_path
+        target_agent, target_conversation = delegation_target_parts(target)
+        record[:inference_id] = owner_index ? Ids.message_id(inference_chat_path, owner_index) : nil
+        record[:source_kind] = :primary
+        record[:target_agent] = target_agent
+        record[:target_conversation] = target_conversation
+      end
+      record
     end
     # Strict copy identity (replaces the old MD5-of-[tool, call_id, arguments]
     # which auto-collapsed identical independent calls whose ids were missing):
@@ -1225,10 +1249,51 @@ module ChatAnalyst
       next unless call[:call_id]
       key = [call[:call_id], call[:name].to_s, timeline_arguments_string(call)]
       first_position = originals[key]
-      records[position][:copy_of] = records[first_position][:call_index] if first_position && first_position != position
+      if first_position && first_position != position
+        records[position][:copy_of] = records[first_position][:call_index]
+        records[position][:source_kind] = :copy
+      end
       originals[key] = position unless first_position
     end
     records
+  end
+
+  # Inference ownership (phase 3, plan step 3; rule PINNED from real chats -
+  # the OPPOSITE of the first-draft "meta follows call" rule): scout-ai
+  # UNSHIFTS each inference meta BEFORE the response segment it accounts for
+  # (backends/default.rb process_response: `output.unshift({role: :meta,
+  # ...})`), so the persisted shape per inference is META, [assistant text],
+  # [the tool calls that response generated], [outputs].  Real-chat evidence
+  # (b3_pin_layout_consolidated, b3_pin_ownership_decisive): dominant
+  # inter-meta segment `function_call_output > META > function_call`
+  # (1026/1034, 507/514, 1131/1133 metas); call execution timestamps sit
+  # closest to the PRECEDING meta (1015:20, 240:15, 520:0).  A call
+  # therefore belongs to the LAST inference meta BEFORE it in the same chat -
+  # its EMITTER; a call with no preceding inference meta (an opening
+  # unaccounted call, or a trailing call after the last meta whose meta
+  # never arrived) stays unassociated.  NO synthetic inference is created.
+  # job= projection markers own nothing (the search chat opens with one).
+  def self.inference_owner_map(chat)
+    owners = {}
+    owner_index = nil
+    chat.each_with_index do |message, index|
+      role = message[:role].to_s
+      if role == 'meta'
+        owner_index = index unless Chat.parse_meta(message[:content].to_s).key?('job')
+      elsif %w[function_call mcp_call].include?(role)
+        owners[index] = owner_index if owner_index
+      end
+    end
+    owners
+  end
+
+  # Split a delegation target "agent#conversation" into its two parts; a
+  # target without '#' keeps the whole string as the agent and nil
+  # conversation.  Returns [nil, nil] for absent targets.
+  def self.delegation_target_parts(target)
+    return [nil, nil] unless String === target && !target.empty?
+    agent, conversation = target.split('#', 2)
+    [agent, conversation.nil? || conversation.empty? ? nil : conversation]
   end
 
   # Canonical comparison spelling for argument identity (parses JSON strings
@@ -1310,7 +1375,7 @@ module ChatAnalyst
   def self.timeline_parse_time(value)
     return nil unless String === value && !value.empty?
     Time.parse(value)
-  rescue ArgumentError, TypeError
+  rescue ParameterException, TypeError
     nil
   end
 

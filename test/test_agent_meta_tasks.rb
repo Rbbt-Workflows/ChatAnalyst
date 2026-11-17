@@ -54,12 +54,17 @@ class TestAgentMetaTasks < Test::Unit::TestCase
   def test_tool_calls_attach_receipt_summary
     Dir.mktmpdir do |dir|
       parent = fixture_receipt_only(dir)
+      # Phase 3 TSV surface: one metadata row per call (ToolCall key = the
+      # call-start Message id); delegation survives as target fields.
       result = ChatAnalyst.job(:chat_tool_calls, {file: parent}).run
-      call = result[:calls].find { |c| c[:tool] == 'ask' }
-      refute_nil call, result.inspect
-      # The structured adapter keeps delegation-target parsing; the receipt
-      # summary is available through the new tool_calls (receipt evidence
-      # counts live in ChatAnalyst.tokens evidence lists).
+      assert_equal 'ToolCall', result.key_field
+      ask_row = result.values.find { |row| row[1] == 'ask' }
+      refute_nil ask_row, result.inspect
+      assert_equal 'true', ask_row[10], 'delegated bool-string'
+      assert_equal 'Worker', ask_row[11], 'target_agent split'
+      assert_equal 'default', ask_row[12], 'target_conversation split'
+      # The structured adapter keeps delegation-target parsing (Ruby API).
+      call = ChatAnalyst.tool_calls(parent)[:calls].find { |c| c[:tool] == 'ask' }
       assert_equal 'Worker#default', call[:delegation_target]
       tokens = ChatAnalyst.tokens(parent)
       receipt_only_events = tokens[:events].select { |e| e[:evidence].any? { |item| item[:origin] == :agent_meta } }
@@ -71,10 +76,9 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent = fixture_conflict(dir)
       result = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert result[:conflicts][:events] == 1
-      assert_equal false, result[:conflicts][:authoritative]
+      assert_equal 1, result.options[:conflicts]
       # Counted once from canonical evidence, not both copies.
-      assert_equal 6 + 4, result[:deduplicated_total][:tt]
+      assert_equal 6 + 4, Integer(result['deduplicated_total']['tt'])
     end
   end
 
@@ -82,11 +86,12 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent = fixture_incomplete_evidence(dir)
       result = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert_equal 1, result[:conflicts][:incomplete_evidence_events]
-      assert_equal 4, result[:deduplicated_total][:tt]
-      assert_equal 0, result[:conflicts][:events]
-      event = result[:events].find { |e| e[:inference_id] == 'h1' }
-      assert_equal 2, event[:evidence].length
+      assert_equal 1, result.options[:incomplete_evidence]
+      assert_equal 4, Integer(result['deduplicated_total']['tt'])
+      assert_equal 0, result.options[:conflicts]
+      events = ChatAnalyst.job(:chat_token_events, {file: parent}).run
+      assert_equal 1, events.values.count { |row| row[8] == 'true' },
+                   'the h1 event flags incomplete evidence'
     end
   end
 
@@ -98,8 +103,8 @@ class TestAgentMetaTasks < Test::Unit::TestCase
       core = Chat.provenance_token_totals(parent)
       assert_equal 157, core[:tt]
       task = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert_equal core[:tt], task[:deduplicated_total][:tt]
-      assert_equal 5, task[:receipt_only][:tt]
+      assert_equal core[:tt], Integer(task['deduplicated_total']['tt'])
+      assert_equal 5, Integer(task['receipt_only']['tt'])
       overview = ChatAnalyst.overview(parent)
       assert overview[:chats].sum { |record| record[:job_references].length } >= 1
     end
@@ -111,10 +116,13 @@ class TestAgentMetaTasks < Test::Unit::TestCase
   def test_report_is_compact
     Dir.mktmpdir do |dir|
       parent, worker = fixture_receipt_plus_log(dir)
-      result = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
-      assert_equal 290, result[:deduplicated_total][:tt]
-      assert result[:attribution][:total][:tt] == 290
-      assert result[:attribution][:linked_jobs].length >= 0
+      # attribution input retired: chat_attribution is the TSV surface.
+      summary = ChatAnalyst.job(:chat_tokens, {file: parent}).run
+      assert_equal 290, Integer(summary['deduplicated_total']['tt'])
+      view = ChatAnalyst.job(:chat_attribution, {file: parent}).run
+      assert_equal 290, view.values.collect { |row| Integer(row[2]) }.sum,
+                   'bucket events add to the deduplicated total'
+      assert_equal 3, view.length, 'root | delegated | unattributed'
     end
   end
 
@@ -124,23 +132,28 @@ class TestAgentMetaTasks < Test::Unit::TestCase
   def test_cortex_continue_interaction_and_delegated_tokens
     Dir.mktmpdir do |dir|
       parent, worker = fixture_cortex_continue(dir)
-      report = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
-      delegation = report[:attribution]
-      assert_equal 156, report[:deduplicated_total][:tt]
-      assert_equal 1, delegation[:linked_jobs].length
-      assert_equal 6, delegation[:root_chat_tokens][:tt]
-      assert_equal 150, delegation[:delegated_tokens][:tt]
-      assert_equal delegation[:root_chat_tokens][:tt] + delegation[:delegated_tokens][:tt],
-                   report[:deduplicated_total][:tt]
-      assert_equal 0, delegation[:unattributed_tokens][:tt]
-      assert_empty delegation[:unresolved_jobs]
+      summary = ChatAnalyst.job(:chat_tokens, {file: parent}).run
+      assert_equal 156, Integer(summary['deduplicated_total']['tt'])
+      view = ChatAnalyst.job(:chat_attribution, {file: parent}).run
+      assert_equal 6, Integer(view['root']['tt']), 'root bucket = root chat own tokens'
+      assert_equal 150, Integer(view['delegated']['tt'])
+      assert_equal 6 + 150, Integer(summary['deduplicated_total']['tt'])
+      assert_equal 0, Integer(view['unattributed']['tt'])
+      # linked/unresolved job lists are NOT cells (contract-settled); they
+      # remain available through ChatAnalyst.attribution.
 
+      # phase-3 TSV chat_accounting: the |-invariant PINNED on REAL
+      # delegated_subtrees values (the only multi-value user in the
+      # contract) and the direct/delegated split in int-string cells.
       accounting = ChatAnalyst.job(:chat_accounting, {file: parent}).run
-      entry = accounting[:entries].find { |e| e[:chat].include?('parent.chat') }
-      assert_equal 6, entry[:direct_tokens][:tt]
-      assert_equal 150, entry[:delegated_tokens][:tt]
-      assert_equal 156, entry[:tokens][:tt]
-      assert_equal 1, entry[:delegated_subtrees].length
+      key = accounting.keys.find { |k| ChatAnalyst::Ids.unescape_path(k).include?('parent.chat') }
+      entry = accounting[key]
+      assert_equal 6, Integer(entry['direct_tt'])
+      assert_equal 150, Integer(entry['delegated_tt'])
+      assert_equal 156, Integer(entry['tt'])
+      assert_equal 1, entry['delegated_subtrees'].split('|').length
+      assert !entry['delegated_subtrees'].include?('#'), 'paths are escaped, not #-free raw'
+      assert accounting.keys.none? { |k| k.include?('|') }, 'keys never carry the separator'
     end
   end
 
@@ -163,7 +176,7 @@ class TestAgentMetaTasks < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       parent = fixture_receipt_only(dir)
       result = ChatAnalyst.job(:chat_messages, {file: parent}).run
-      assert result.none? { |m| m[:role].to_s.include?('agent_meta') }
+      assert result.values.none? { |row| row[0].include?('agent_meta') }
     end
   end
 end

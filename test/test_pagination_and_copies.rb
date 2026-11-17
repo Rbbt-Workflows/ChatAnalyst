@@ -27,63 +27,70 @@ class TestPaginationAndCopies < Test::Unit::TestCase
     write_chat(dir, 'one.chat', text + "meta: job=#{job}\n")
   end
 
+  # Phase 3 conversion (contract 2D): chat_tool_calls is a TSV (key
+  # ToolCall).  The JSON summary block (failures/copies/by_tool) is NOT an
+  # annotation (settled simplification: everything in it is derivable from
+  # the rows); the pagination total stays raw.
   def test_chat_tool_calls_pagination_and_dedupe
     Dir.mktmpdir do |dir|
       path = fixture_with_calls(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
-      assert_equal 6, result[:total]
-      assert_equal 6, result[:calls].length
-      assert_equal 2, result[:failures]
-      assert result[:calls].none? { |call| call[:copy_of] }
-      # the by_tool histogram counts both copies: projections are real evidence
-      assert_equal 4, result[:by_tool]['bash']
-      assert_equal 2, result[:by_tool]['read']
+      assert_equal 6, result.length
+      assert_equal 6, result.total
+      assert result.values.none? { |row| row[13] != '\\N' }, 'no copy markings without dedupe'
+      # the tool histogram is derivable from the rows: projections are real
+      # evidence (bash x4 incl. copy, read x2)
+      assert_equal 4, result.values.count { |row| row[1] == 'bash' }
+      assert_equal 2, result.values.count { |row| row[1] == 'read' }
+      assert_equal 2, result.values.count { |row| row[3] == 'failure' }
 
       paged = ChatAnalyst.job(:chat_tool_calls, {file: path, page: 2, per_page: 4}).run
-      assert_equal 2, paged[:calls].length
-      assert_equal 2, paged[:total_pages]
-      assert_equal 6, paged[:total]
-      assert_equal 1, paged[:prev_page]
-      assert_nil paged[:next_page]
-      # counts still cover every call, not just the page
-      assert_equal 2, paged[:failures]
-      assert_equal 4, paged[:by_tool]['bash']
+      assert_equal 2, paged.length
+      assert_equal 2, paged.total_pages
+      assert_equal 6, paged.total
+      assert_equal 1, paged.prev_page
+      assert_nil paged.next_page
+      # the page rows carry the same columns as the unpaginated table
+      assert paged.values.all? { |row| row.length == result.values.first.length }
 
+      # dedupe MARKS copies (copy_of/source_kind columns) instead of
+      # dropping rows: 6 rows, 3 marked copy, 3 primary
       deduped = ChatAnalyst.job(:chat_tool_calls, {file: path, dedupe: true}).run
-      assert_equal 6, deduped[:total]
-      assert_equal 3, deduped[:copies]
-      assert_equal 3, deduped[:unique_calls]
-      assert_equal 3, deduped[:calls].count { |call| call[:copy_of] }
-      assert_equal 3, deduped[:calls].count { |call| !call[:copy_of] }
+      assert_equal 6, deduped.total, 'total stays raw under dedupe'
+      assert_equal 6, deduped.length, 'dedupe marks copies, it does not drop rows'
+      assert_equal 3, deduped.values.count { |row| row[13] != '\\N' }
+      assert_equal 3, deduped.values.count { |row| row[13] == '\\N' }
+      assert_equal 3, deduped.values.count { |row| row[14] == 'primary' }
+      assert_equal 3, deduped.values.count { |row| row[14] == 'copy' }
 
       # paged and deduped combine: pages carry copy markings too
       paged_deduped = ChatAnalyst.job(:chat_tool_calls, {file: path, page: 1, per_page: 4, dedupe: true}).run
-      assert_equal 6, paged_deduped[:total]
-      assert_equal 3, paged_deduped[:unique_calls]
-      assert_equal 4, paged_deduped[:calls].length
+      assert_equal 6, paged_deduped.total
+      assert_equal 2, paged_deduped.total_pages
+      assert_equal 4, paged_deduped.length
     end
   end
 
-  def test_chat_tokens_pagination
+  # chat_tokens is the SUMMARY table now (contract 2E); the paginated event
+  # list lives on chat_token_events.
+  def test_chat_tokens_is_the_summary_table
     Dir.mktmpdir do |dir|
       parent = fixture_receipt_only(dir)
-      result = ChatAnalyst.job(:chat_tokens, {file: parent}).run
-      assert_equal 3, result[:events].length
+      summary = ChatAnalyst.job(:chat_tokens, {file: parent}).run
+      assert_equal 'Scope', summary.key_field
+      assert_equal 4, summary.length
+      assert_equal 4, summary.total
+      assert_equal %w[chat_evidence deduplicated_total receipt_evidence receipt_only],
+                   summary.keys.sort
+      assert Integer === summary.conflicts
+      assert Integer === summary.incomplete_evidence
 
-      paged = ChatAnalyst.job(:chat_tokens, {file: parent, page: 1, per_page: 2}).run
-      assert_equal 2, paged[:events].length
-      assert_equal 2, paged[:total_pages]
-      assert_equal 3, paged[:total]
-      # Minimal revision phase 2 (plan step 5 layering): an event page is a
-      # PAGE, not a repeated summary — it carries events + paging metadata +
-      # root only, and the flat totals stay on the unpaginated shape.
-      assert_equal %i[page per_page total total_pages next_page prev_page events root],
-                   paged.keys.sort_by { |key| paged.keys.index(key) }
-      assert_equal parent, paged[:root][:path]
-      refute paged.key?(:deduplicated_total), 'event page must not repeat summary totals'
-      refute paged.key?(:scopes), 'event page must not repeat scopes'
-      refute paged.key?(:conflicts), 'event page must not repeat conflicts'
-      refute paged.key?(:warnings), 'event page must not repeat warnings'
+      events = ChatAnalyst.job(:chat_token_events, {file: parent}).run
+      assert_equal 3, events.length
+      paged = ChatAnalyst.job(:chat_token_events, {file: parent, page: 1, per_page: 2}).run
+      assert_equal 2, paged.length
+      assert_equal 2, paged.total_pages
+      assert_equal 3, paged.total
     end
   end
 
@@ -106,9 +113,9 @@ class TestPaginationAndCopies < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       path = fixture_with_calls(dir)
       result = ChatAnalyst.job(:chat_tool_calls, {file: path}).run
-      assert_equal 6, result[:total]
-      assert_equal 2, result[:failures]
-      assert_equal 4, result[:by_tool]['bash']
+      assert_equal 6, result.length
+      assert_equal 2, result.values.count { |row| row[3] == 'failure' }
+      assert_equal 4, result.values.count { |row| row[1] == 'bash' }
       error = assert_raise(TaskNotFound) { ChatAnalyst.job(:chat_report, {file: path}).run }
       assert_match(/chat_report/, error.message)
     end

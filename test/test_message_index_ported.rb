@@ -2,16 +2,18 @@ $LOAD_PATH.unshift '.'
 require 'test/test_helper'
 require 'test/scout/agent_meta_fixtures'
 
-# Minimal revision phase 2 (retirement 5c): the retired message_index
-# adapter's whole-session size/filter/pagination pins carried forward on
-# chat_messages (the phase-1 surface).  The retired adapter indexed EVERY
-# chat of the traversal in one flat address list; the replacement indexes
-# ONE chat per call — the migrated agent iterates overview chat paths
-# (recorded deliberate loss, not a gap).  The PINS that survive unchanged:
-# character counts, the large flag, the role filter, pagination and the
-# meta-entry size fields — all against the same sized fixture.
+# Minimal revision phase 2 (retirement 5c), PHASE 3 CONVERSION (bout 4):
+# the retired message_index adapter's whole-session size/filter/pagination
+# pins carried forward on chat_messages, now in TSV form (contract 2B).
+# The retired adapter indexed EVERY chat of the traversal in one flat
+# address list; the replacement indexes ONE chat per call — the migrated
+# agent iterates overview chat paths (recorded deliberate loss, not a gap).
+# The PINS that survive unchanged, against the same sized fixture:
+# character counts, the large flag, the role filter, pagination semantics
+# (total counts the RAW universe) and the meta-entry size fields.
 class TestChatMessagesCarriesMessageIndexPins < Test::Unit::TestCase
   include ChatAnalystFixtures
+  include Phase3TSVHelpers if defined?(Phase3TSVHelpers)
 
   def write_chat(path, text)
     File.write(path, text)
@@ -29,14 +31,18 @@ class TestChatMessagesCarriesMessageIndexPins < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       path = sized_chat(dir)
       result = ChatAnalyst.job(:chat_messages, {file: path}).run
-      assert result.all? { |message| Integer === message[:characters] }, 'every entry carries an integer characters'
-      assert_equal [9, 9, 150_000, 4], result.collect { |message| message[:characters] }
-      assert result.all? { |message| message.key?(:large) }, 'every entry carries the large key'
-      assert_equal [false, false, true, false], result.collect { |message| message[:large] }
-      # the meta entry keeps both keys even though it carries no content
-      meta_entry = result.find { |message| message[:role] == 'meta' }
-      assert_equal 4, meta_entry[:characters]
-      assert_equal false, meta_entry[:large]
+      assert_equal 'Message', result.key_field
+      assert_equal %w[role characters timestamp large], result.fields
+      assert result.values.all? { |row| row[1].match?(/\A\d+\z/) }, 'every row carries a decimal character count'
+      assert_equal ['9', '9', '150000', '4'], result.values.collect { |row| row[1] }
+      assert result.values.all? { |row| %w[true false].include?(row[3]) }, 'every row carries a boolean large flag'
+      assert_equal ['false', 'false', 'true', 'false'], result.values.collect { |row| row[3] }
+      # the meta entry keeps both fields even though it carries no content
+      meta_key = result.keys.find { |key| key.end_with?('#3') }
+      meta_row = result[meta_key]
+      assert_equal 'meta', meta_row[0]
+      assert_equal '4', meta_row[1]
+      assert_equal 'false', meta_row[3]
     end
   end
 
@@ -44,12 +50,20 @@ class TestChatMessagesCarriesMessageIndexPins < Test::Unit::TestCase
     Dir.mktmpdir do |dir|
       path = sized_chat(dir)
       only_user = ChatAnalyst.job(:chat_messages, {file: path, role: 'user'}).run
-      assert_equal [9, 150_000], only_user.collect { |message| message[:characters] }
+      assert_equal ['9', '150000'], only_user.values.collect { |row| row[1] }
+      assert_equal 2, only_user.length
+      # the role filter narrows the LIST only; total counts the raw chat
+      assert_equal 4, only_user.options[:total]
 
       paged = ChatAnalyst.job(:chat_messages, {file: path, page: 1, per_page: 3}).run
-      assert_equal 3, paged[:messages].length
-      assert_equal 4, paged[:total]
-      assert paged[:messages].all? { |message| message.key?(:characters) && message.key?(:large) }
+      assert_equal 3, paged.length
+      assert_equal 4, paged.options[:total]
+      assert_equal 2, paged.options[:total_pages]
+      assert_equal 2, paged.options[:next_page]
+      # out-of-range page: empty rows, never an error; total unchanged
+      past = ChatAnalyst.job(:chat_messages, {file: path, page: 9}).run
+      assert_equal 0, past.length
+      assert_equal 4, past.options[:total]
     end
   end
 
@@ -58,8 +72,8 @@ class TestChatMessagesCarriesMessageIndexPins < Test::Unit::TestCase
       text = "user:\n\n#{'y' * 100_000}\n\nassistant:\n\n#{'z' * 100_001}\n"
       path = write_chat(File.join(dir, 'boundary.chat'), text)
       result = ChatAnalyst.job(:chat_messages, {file: path}).run
-      assert_equal [100_000, 100_001], result.collect { |message| message[:characters] }
-      assert_equal [false, true], result.collect { |message| message[:large] }
+      assert_equal ['100000', '100001'], result.values.collect { |row| row[1] }
+      assert_equal ['false', 'true'], result.values.collect { |row| row[3] }
       assert_equal 100_000, ChatAnalyst::LARGE_MESSAGE_CHARACTERS
     end
   end

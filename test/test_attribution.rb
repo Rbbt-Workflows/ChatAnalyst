@@ -117,7 +117,11 @@ class TestAttribution < Test::Unit::TestCase
 
   # -- task surface: chat_tokens attribution view ---------------------------------
 
-  def test_chat_tokens_carries_attribution_view_when_requested
+  # Phase 3 behavior-change pin (contract 2E): the chat_tokens attribution
+  # INPUT is RETIRED.  Passing it now raises a ParameterException (unknown
+  # input), and the attribution view is its own task, chat_attribution, which
+  # serializes the same promoted ChatAnalyst.attribution computation.
+  def test_chat_tokens_attribution_input_retired
     Dir.mktmpdir do |dir|
       parent, _worker = fixture_cortex_continue(dir)
       calls = 0
@@ -127,17 +131,23 @@ class TestAttribution < Test::Unit::TestCase
         __tokens_without_spy2(*args, &block)
       end
       begin
-        with_view = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
-        without_view = ChatAnalyst.job(:chat_tokens, {file: parent}).run
+        # Unknown-input semantics pinned in the tool/token suite: the job
+        # layer IGNORES undeclared keys, so the run SUCCEEDS as the summary
+        # table and the retired input never reaches the task body.
+        result = ChatAnalyst.job(:chat_tokens, {file: parent, attribution: true}).run
+        assert_equal 'Scope', result.key_field, 'summary table, not a view'
+        assert_equal 4, result.length
+        # the summary run is one tokens call (the ignored input adds none)
+        assert_equal 1, calls
 
-        assert_equal 2, calls, 'one tokens call for the summary, one for the attribution view'
-        refute without_view.key?(:attribution), 'the view is opt-in only'
-        view = with_view[:attribution]
-        assert view, 'attribution: true must attach the view'
-        assert_equal 156, view[:total][:tt]
-        assert_equal 150, view[:delegated_tokens][:tt]
-        assert_equal 1, view[:linked_jobs].length
-        JSON.generate(with_view)
+        summary = ChatAnalyst.job(:chat_tokens, {file: parent}).run
+        refute summary.respond_to?(:key?) && summary.key?(:attribution)
+        view = ChatAnalyst.job(:chat_attribution, {file: parent}).run
+        assert_equal 'Bucket', view.key_field
+        assert_equal 3, view.length, 'root | delegated | unattributed'
+        assert_equal '6', view['root'][2]
+        assert_equal '150', view['delegated'][2]
+        assert_equal '0', view['unattributed'][2]
       ensure
         ChatAnalyst.singleton_class.send(:alias_method, :tokens, :__tokens_without_spy2)
         ChatAnalyst.singleton_class.send(:remove_method, :__tokens_without_spy2)

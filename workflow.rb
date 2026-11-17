@@ -131,10 +131,47 @@ module ChatAnalyst
 
 
 
+  # Contract 2F accounting columns (phase 3): all counts are int-strings in
+  # the mixed all-String table; imports/unresolved_imports/delegated_subtrees
+  # are multi-value cells (|-joined, |-free enforced by TSVBase.multi).
+  ACCOUNTING_FIELDS = %w[imports unresolved_imports messages pt ct tt cct cwt rt
+                         token_events conflicts incomplete_evidence tool_calls direct_jobs
+                         direct_pt direct_ct direct_tt direct_cct direct_cwt direct_rt direct_events
+                         delegated_pt delegated_ct delegated_tt delegated_cct delegated_cwt delegated_rt
+                         delegated_events delegated_subtrees warnings].freeze
+
+  # One encoded accounting row: the direct/delegated token columns are summed
+  # from the GIVEN event arrays (the same partition the caller computed), so
+  # the own and closure scopes share one row spelling.
+  helper :accounting_row do |chat:, imports:, unresolved_imports:, messages:, tokens:, token_events:,
+                             conflicts:, incomplete_evidence:, tool_calls:, direct_jobs:,
+                             direct_events:, delegated_events:, delegated_subtrees:, warnings:|
+    token_sum = lambda do |events, key|
+      events.sum { |event| (event[:tokens] || {})[key] || 0 }
+    end
+    count_fields = %i[pt ct tt cct cwt rt]
+    [ChatAnalyst::Ids.chat_id(chat),
+     [ChatAnalyst::TSVBase.multi(imports, encoder: :path),
+      ChatAnalyst::TSVBase.multi(unresolved_imports, encoder: :text),
+      ChatAnalyst::TSVBase.integer(messages)] +
+       count_fields.collect { |key| ChatAnalyst::TSVBase.integer(tokens[key]) } +
+       [ChatAnalyst::TSVBase.integer(token_events.length),
+        ChatAnalyst::TSVBase.integer(conflicts),
+        ChatAnalyst::TSVBase.integer(incomplete_evidence),
+        ChatAnalyst::TSVBase.integer(tool_calls),
+        ChatAnalyst::TSVBase.integer(direct_jobs)] +
+       count_fields.collect { |key| ChatAnalyst::TSVBase.integer(token_sum.call(direct_events, key)) } +
+       [ChatAnalyst::TSVBase.integer(direct_events.length)] +
+       count_fields.collect { |key| ChatAnalyst::TSVBase.integer(token_sum.call(delegated_events, key)) } +
+       [ChatAnalyst::TSVBase.integer(delegated_events.length),
+        ChatAnalyst::TSVBase.multi(delegated_subtrees, encoder: :path),
+        ChatAnalyst::TSVBase.integer(warnings)]]
+  end
+
   input :file, :path, 'Root chat file or chat-producing job', nil, required: true, jobname: true, nofile: true
   input :scope, :string, "Accounting scope: 'own' (default) accounts each chat in the import closure separately from its own file; 'closure' merges the whole closure into one root entry", 'own', nofile: true
-  desc 'Separate accounting for a chat and every chat it imports, without merging imported costs into the root. Each own-scope entry also splits its tokens into direct_tokens (canonical evidence in the chat file itself) and delegated_tokens (canonical evidence in delegation subtrees).'
-  task :chat_accounting => :json do |file, scope|
+  desc 'Accounting TSV for a chat and every chat it imports (contract 2F): own scope = one row per closure chat, closure scope = ONE merged row keyed by the root (the scope annotation carries which). Columns: imports/unresolved_imports/delegated_subtrees (multi, |-joined, |-free enforced), messages, pt..rt, token_events, conflicts, incomplete_evidence, tool_calls, direct_jobs, direct_pt..rt, direct_events, delegated_pt..rt, delegated_events, warnings - all int-strings (mixed table, no cast). Chat-root-only guard and the once-per-chat single-pass composition are unchanged.'
+  task :chat_accounting => :tsv do |file, scope|
     root_kind, root = resolve_root(file)
     raise ParameterException, 'chat_accounting requires a chat file root; pass the chat path directly' unless root_kind == :chat
 
@@ -168,49 +205,55 @@ module ChatAnalyst
     closure = fetch.call(path)[:relationships][:import_closure].map(&:to_s)
     closure = [path] if closure.empty?
 
-    tokens_sum = lambda do |subset|
-      subset.each_with_object({pt: 0, ct: 0, tt: 0, cct: 0, cwt: 0, rt: 0}) do |event, sum|
-        event[:tokens].each { |key, value| sum[key] += value if sum.key?(key) }
-      end
-    end
-
-    entries = closure.collect do |chat|
-      data = fetch.call(chat)
-      report = data[:report]
-      events = report[:events]
-      direct, delegated = events.partition do |event|
+    count_fields = %i[pt ct tt cct cwt rt]
+    # Direct/delegated partition (phase-2 semantics, unchanged): canonical
+    # evidence (evidence.first) whose source is the chat file itself is
+    # direct; anything else is delegated spend.
+    partition = lambda do |chat|
+      events = fetch.call(chat)[:report][:events]
+      events.partition do |event|
         evidence = event[:evidence].first
         evidence && evidence[:source] == chat
       end
+    end
 
+    token_sum = lambda do |events|
+      count_fields.each_with_object({}) do |key, sum| sum[key] = 0 end.tap do |sum|
+        events.each do |event|
+          (event[:tokens] || {}).each { |key, value| sum[key] += value if sum.key?(key) }
+        end
+      end
+    end
+
+    rows = closure.collect do |chat|
+      data = fetch.call(chat)
+      report = data[:report]
+      direct_events, delegated_events = partition.call(chat)
       overview = data[:overview]
       imports = data[:relationships][:references].select { |reference| reference[:type] == :import }
-      {
-        scope: :own,
+      accounting_row(
         chat: chat,
         imports: imports.collect { |relationship| relationship[:target] }.compact,
         unresolved_imports: imports.reject { |relationship| relationship[:resolved] }
                                    .collect { |relationship| relationship[:reference] },
         messages: overview[:chats].sum { |record| record[:messages] },
         tokens: report[:scopes][:deduplicated_total],
-        token_events: events.length,
+        token_events: report[:events],
         conflicts: report[:conflicts][:events],
         incomplete_evidence: report[:conflicts][:incomplete_evidence_events],
         tool_calls: overview[:chats].sum { |record| ChatAnalyst.tool_calls(record[:path])[:calls].length },
         direct_jobs: overview[:jobs].length,
-        direct_tokens: tokens_sum.call(direct),
-        direct_events: direct.length,
-        delegated_tokens: tokens_sum.call(delegated),
-        delegated_events: delegated.length,
+        direct_events: direct_events,
+        delegated_events: delegated_events,
         delegated_subtrees: overview[:chats].flat_map { |record| record[:job_references].values.flatten }.uniq,
         warnings: report[:warnings].length
-      }
+      )
     end
 
-    # Closure scope: one root entry merging every entry's events with
-    # identity deduplication, so shared work is never double counted.  The
-    # merge reads the SAME memoized per-chat event lists the own-scope
-    # entries were built from; tokens is never re-called.
+    # Closure scope: ONE merged row keyed by the root, every chat's events
+    # deduplicated by identity so shared work is never double counted.  The
+    # merge reads the SAME memoized per-chat event lists the own-scope rows
+    # were built from; tokens is never re-called.
     if scope == 'closure'
       merged = {}
       closure.each do |chat|
@@ -220,45 +263,51 @@ module ChatAnalyst
         end
       end
       deduplicated = merged.values
-      totals = deduplicated.each_with_object({pt: 0, ct: 0, tt: 0, cct: 0, cwt: 0, rt: 0}) do |event, sum|
-        event[:tokens].each { |key, value| sum[key] += value if sum.key?(key) }
-      end
-
-      entries = [{
-        scope: :closure,
+      own_direct = closure.flat_map { |chat| partition.call(chat).first }
+      own_delegated = closure.flat_map { |chat| partition.call(chat).last }
+      rows = [accounting_row(
         chat: path,
-        chats: closure,
-        tokens: totals,
-        token_events: deduplicated.length,
+        imports: closure.reject { |chat| chat == path },
+        unresolved_imports: [],
+        messages: closure.sum { |chat| fetch.call(chat)[:overview][:chats].sum { |record| record[:messages] } },
+        tokens: token_sum.call(deduplicated),
+        token_events: deduplicated,
         conflicts: deduplicated.count { |event| event[:conflict] },
         incomplete_evidence: deduplicated.count { |event| event[:incomplete_evidence] },
-        token_events_per_chat: closure.to_h { |chat| [chat, fetch.call(chat)[:report][:events].length] }
-      }]
+        tool_calls: closure.sum { |chat| fetch.call(chat)[:overview][:chats].sum { |record| ChatAnalyst.tool_calls(record[:path])[:calls].length } },
+        direct_jobs: closure.sum { |chat| fetch.call(chat)[:overview][:jobs].length },
+        direct_events: own_direct,
+        delegated_events: own_delegated,
+        delegated_subtrees: closure.flat_map { |chat| fetch.call(chat)[:overview][:chats].flat_map { |record| record[:job_references].values.flatten } }.uniq,
+        warnings: closure.sum { |chat| fetch.call(chat)[:report][:warnings].length }
+      )]
     end
 
-    {
-      source: path,
-      scope: scope.to_sym,
-      closure: closure,
-      entries: entries,
-      note: 'own scope: each chat is accounted from its own file with its own provenance; imported chats never contribute to another entry. closure scope merges all events with identity deduplication. direct_tokens + delegated_tokens partition the deduplicated events by canonical-evidence source.'
-    }
+    ChatAnalyst::TSVBase.build_table(
+      key_field: 'Chat', fields: ACCOUNTING_FIELDS, rows: rows,
+      annotations: {
+        root_path: ChatAnalyst::Ids.escape_path(path),
+        total: rows.length,
+        scope: scope
+      }
+    )
   end
 
   # --- inbox access (live advice injection) ---
 
-  # One chat log as a compact live-chat entry. Files are reported with path,
-  # mtime, age, size and a likely_active flag for the newest log, so the task
-  # answers "which chat is being written right now" without reading content.
-  helper :live_chat_entry do |path, reference_time, likely_active: false|
+  # One chat log as one LIVE-CHATS TSV row (contract 2F): the CANONICAL chat
+  # path is the key (Ids.chat_id -> Chat.provenance_path(:chat, ...), the
+  # realpathed absolute spelling; the JSON task's ~/ shortening is dropped so
+  # the live output matches every other chat key in the phase-3 surface).
+  helper :live_chat_row do |path, reference_time, source, jobs_file: nil, likely_active: false|
     mtime = File.mtime(path)
-    {
-      path: short_path_from_path(path),
-      mtime: mtime.iso8601,
-      age: (reference_time - mtime).round(3),
-      size: File.size(path),
-      likely_active: likely_active
-    }
+    [ChatAnalyst::Ids.chat_id(path),
+     [ChatAnalyst::TSVBase.timestamp(mtime),
+      ChatAnalyst::TSVBase.float((reference_time - mtime).round(3)),
+      ChatAnalyst::TSVBase.integer(File.size(path)),
+      ChatAnalyst::TSVBase.boolean(likely_active),
+      ChatAnalyst::TSVBase.text(source.to_s),
+      ChatAnalyst::TSVBase.path(jobs_file)]]
   end
 
   # Live-chat discovery. Provenance traversal is the primary source: it
@@ -424,8 +473,8 @@ module ChatAnalyst
   end
 
   input :file, :path, 'Chat file or chat-producing job root', nil, required: true, jobname: true, nofile: true
-  desc 'Discover the live chat logs of a session, newest first, flagging the one most likely to be receiving writes.'
-  task :live_chats => :json do |file|
+  desc 'Live-chat discovery TSV (contract 2F): newest-first rows keyed by the CANONICAL chat path, fields mtime (iso8601(3)), age_seconds (decimal string), size (int-str), likely_active (bool-string), source (provenance|glob|jobs) and jobs_file (escaped path or \\N, :jobs rows only). The three discovery sources keep their precedence and fail-soft behavior (vanishing chats skipped). Recorded simplification: the JSON job-root status block is dropped (it described the root, not a row; the root is addressable through chat_overview/job_overview).'
+  task :live_chats => :tsv do |file|
     root_kind, root = resolve_root(file)
     files, primary_source = live_chat_files(root_kind, root)
 
@@ -444,61 +493,64 @@ module ChatAnalyst
     known = files.collect { |path| File.expand_path(path.to_s) }
     in_flight.reject! { |entry| known.include?(entry[:path]) }
 
-    reference = Time.now
-    entries = files.collect { |path| live_chat_entry(path, reference).merge(source: primary_source) }
-    entries.concat(in_flight.filter_map do |entry|
-                     begin
-                       live_chat_entry(entry[:path], reference)
-                         .merge(source: :jobs, jobs_file: short_path_from_path(entry[:jobs_file]))
-                     rescue StandardError
-                       # the chat vanished while being read: the delegated
-                       # job finished and cleaned up; report nothing for it
-                       nil
-                     end
-                   end)
-    entries = entries.sort_by { |entry| [-Time.parse(entry[:mtime]).to_i, entry[:path]] }
-    entries.first[:likely_active] = true unless entries.empty?
+    # The discovery mode that produced the rows is recorded in the comment
+    # above; the per-row source cells say provenance/glob/jobs themselves.
+    _table_source = files.any? ? primary_source : (in_flight.any? ? :jobs : primary_source)
 
-    {
-      root: short_path_from_path(Chat.provenance_path(root_kind, root)),
-      root_kind: root_kind,
-      chats: entries,
-      total: entries.length,
-      # The mode that produced the reported chats: the traversal mode when
-      # it found anything, :jobs when only in-flight discovery did; when
-      # nothing was found the fallback mode is kept, as before.
-      source: files.any? ? primary_source : (in_flight.any? ? :jobs : primary_source),
-      job: root_kind == :job ? {
-        status: root.status,
-        running: root.running?,
-        done: root.done?,
-        error: root.error?,
-        aborted: root.aborted?,
-        started: root.started?
-      } : nil
-    }
+    reference = Time.now
+    rows = files.collect do |path|
+      begin
+        live_chat_row(path, reference, primary_source)
+      rescue StandardError
+        nil
+      end
+    end.compact
+    rows.concat(in_flight.filter_map do |entry|
+                  begin
+                    live_chat_row(entry[:path], reference, :jobs,
+                                  jobs_file: File.expand_path(entry[:jobs_file].to_s))
+                  rescue StandardError
+                    # the chat vanished while being read: the delegated
+                    # job finished and cleaned up; report nothing for it
+                    nil
+                  end
+                end)
+    # Newest-first flag: the first surviving row (newest mtime) is the one
+    # most likely to be receiving writes.
+    rows.sort_by! { |row| [-Time.parse(row[1][0]).to_i, row[0]] }
+    rows.first && rows.first[1][3] = 'true' unless rows.empty?
+
+    ChatAnalyst::TSVBase.build_table(
+      key_field: 'Chat',
+      fields: %w[mtime age_seconds size likely_active source jobs_file],
+      rows: rows,
+      annotations: {
+        root_path: ChatAnalyst::Ids.escape_path(Chat.provenance_path(root_kind, root)),
+        total: rows.length
+      }
+    )
   end
 
-  # Inbox file description: full content included, because inbox notes are
-  # short by design and the whole point of the state task is to read them.
-  helper :inbox_entry do |path|
-    mtime = File.mtime(path)
-    {
-      name: File.basename(path),
-      mtime: mtime.iso8601,
-      size: File.size(path),
-      content: Open.read(path)
-    }
+  # One inbox note as one INDEX row (contract 2F): NO note body.  The body
+  # surface is inbox_note (point read); pinning the index-only behavior is
+  # the recorded phase-3 behavior change for inbox_state.
+  helper :inbox_note_row do |path, state|
+    mtime = File.mtime(path) rescue nil
+    return nil unless mtime
+    [ChatAnalyst::Ids.escape_path(File.expand_path(path)),
+     [ChatAnalyst::TSVBase.text(state.to_s),
+      ChatAnalyst::TSVBase.text(File.basename(path)),
+      ChatAnalyst::TSVBase.timestamp(mtime),
+      ChatAnalyst::TSVBase.integer((File.size(path) rescue nil))]]
   end
 
   input :file, :path, 'Chat file (the save_file whose inbox is inspected)', nil, required: true, jobname: true, nofile: true
-  desc 'Pending and delivered inbox messages of a chat, with full content; missing directories are empty lists, never errors.'
-  task :inbox_state => :json do |file|
+  desc 'Inbox INDEX TSV (contract 2F): one row per pending/delivered note keyed by the absolute escaped note path, fields state (pending|delivered), name, mtime, size. Recorded behavior change: note bodies are NO LONGER embedded (read them with inbox_note). Missing directories are an empty table, never an error; the per-entry race tolerance is unchanged (a note consumed between listing and stat is skipped).'
+  task :inbox_state => :tsv do |file|
     root_kind, root = resolve_root(file)
     raise ParameterException, 'inbox_state requires a chat file root; pass the chat path directly' unless root_kind == :chat
 
     save_file = File.expand_path(root.to_s)
-    files_dir = save_file + '.files'
     # scout-ai owns the inbox location (per-save-file sibling of the save
     # file, not a subdir of <save_file>.files); the helpers are the only
     # sanctioned way to derive it.
@@ -508,31 +560,49 @@ module ChatAnalyst
     # The inbox is read while a live inference may be consuming it: a note
     # that moves between listing and reading is a race that resolves by
     # skipping the entry, never by failing the whole report.
-    describe_inbox_files = lambda do |dir|
+    describe_inbox_files = lambda do |dir, state|
       (File.directory?(dir) ? Dir.glob(File.join(dir, '*')).select { |f| File.file?(f) } : [])
-        .collect { |path| (inbox_entry(path) rescue nil) }
+        .collect { |path| (inbox_note_row(path, state) rescue nil) }
         .compact
-        .sort_by { |entry| entry[:name] }
+        .sort_by { |row| row[1][1] }
     end
 
-    pending = describe_inbox_files.call(inbox_dir)
-    delivered = describe_inbox_files.call(removed_dir)
+    rows = describe_inbox_files.call(inbox_dir, :pending)
+    rows.concat(describe_inbox_files.call(removed_dir, :delivered))
 
-    {
-      save_file: short_path_from_path(save_file),
-      files_dir: short_path_from_path(files_dir),
-      inbox_dir: short_path_from_path(inbox_dir),
-      inbox_removed_dir: short_path_from_path(removed_dir),
-      pending: pending,
-      delivered: delivered
-    }
+    ChatAnalyst::TSVBase.build_table(
+      key_field: 'Note', fields: %w[state name mtime size], rows: rows,
+      annotations: {
+        root_path: ChatAnalyst::Ids.escape_path(save_file),
+        total: rows.length
+      }
+    )
+  end
+
+  input :file, :path, 'Chat file (the save_file whose inbox holds the note)', nil, required: true, jobname: true, nofile: true
+  input :name, :string, 'Inbox note file name (plain name, no path)', nil, required: true, nofile: true
+  desc 'Read ONE inbox note (:text output; the note\'s exact contents). A point read, not discovery: the note name must be a plain file name and the note must exist in the pending or delivered inbox of the save file, else ParameterException. Together with the index-only inbox_state this replaces the old full-content embedding.'
+  task :inbox_note => :text do |file, name|
+    root_kind, root = resolve_root(file)
+    raise ParameterException, 'inbox_note requires a chat file root; pass the chat path directly' unless root_kind == :chat
+    name = name.to_s
+    raise ParameterException, 'Inbox note name must be a plain file name, not a path' if name.include?('/')
+    raise ParameterException, 'Inbox note name must not be empty' if name.strip.empty?
+
+    save_file = File.expand_path(root.to_s)
+    candidates = [File.join(Chat.inbox_dir(save_file), name),
+                  File.join(Chat.inbox_removed_dir(save_file), name)]
+    note = candidates.find { |path| File.file?(path) }
+    raise ParameterException,
+          "Inbox note not found: #{name} (looked in the pending and delivered inboxes of #{save_file})" unless note
+    Open.read(note)
   end
 
   input :file, :path, 'Chat file (the save_file whose inbox receives the advice)', nil, required: true, jobname: true, nofile: true
   input :message, :string, 'Advice text to deliver on the next real inference', nil, required: true, nofile: true
   input :name, :string, 'Inbox file name (default: timestamped advice note)', nil, nofile: true
-  desc 'Post advice into a live chat inbox; it is delivered as a user message on the next real inference and never persisted in the transcript.'
-  task :post_inbox_advice => :json do |file, message, name|
+  desc 'Post advice into a live chat inbox (contract 2F): ONE-row TSV result (name, save_file, inbox_dir, size) keyed by the escaped posted path; the posting itself is the side effect. Every safeguard is kept: chat-root guard, plain-file-name validation, non-empty message, reserved abort name rejected BEFORE any write, no-overwrite on an existing note, default timestamped name. The note is delivered as a user message on the next real inference and never persisted in the transcript (delivery semantics: consume-once; the moved file in inbox_removed/ is the delivery record).'
+  task :post_inbox_advice => :tsv do |file, message, name|
     root_kind, root = resolve_root(file)
     raise ParameterException, 'post_inbox_advice requires a chat file root; pass the chat path directly' unless root_kind == :chat
 
@@ -559,23 +629,91 @@ module ChatAnalyst
     raise ParameterException, "Inbox note already exists: #{name}" if File.exist?(target)
     Open.write(target, message)
 
-    {
-      posted: short_path_from_path(target),
-      name: name,
-      save_file: short_path_from_path(save_file),
-      inbox_dir: short_path_from_path(inbox_dir),
-      size: File.size(target),
-      note: 'delivered as a user message on the next real inference; consume-once; the moved file in inbox_removed/ is the delivery record'
-    }
+    ChatAnalyst::TSVBase.build_table(
+      key_field: 'Posted', fields: %w[name save_file inbox_dir size],
+      rows: [[ChatAnalyst::Ids.escape_path(File.expand_path(target)),
+              [ChatAnalyst::TSVBase.text(name),
+               ChatAnalyst::TSVBase.path(save_file),
+               ChatAnalyst::TSVBase.path(inbox_dir),
+               ChatAnalyst::TSVBase.integer(File.size(target))]]],
+      annotations: {
+        root_path: ChatAnalyst::Ids.escape_path(save_file),
+        total: 1
+      }
+    )
+  end
+
+  # One live-report entry as one TSV row (contract 2F): serializes
+  # ChatAnalyst.live (the fail-soft wrapper over Chat.live_report) - the
+  # entry shapes are the core's, never re-derived here.
+  helper :chat_live_report_row do |entry|
+    reference = entry[:reference].to_s
+    path = entry[:path] || entry[:agent_file] || entry[:job]
+    key = reference.empty? ? ChatAnalyst::Ids.escape_path(path.to_s) : reference
+    sources = [entry[:source]].flatten.compact.uniq.collect(&:to_s)
+    [key,
+     [ChatAnalyst::TSVBase.text(entry[:kind].to_s),
+      ChatAnalyst::TSVBase.path(path),
+      ChatAnalyst::TSVBase.text(entry[:state] && entry[:state].to_s),
+      ChatAnalyst::TSVBase.text(entry[:status]),
+      ChatAnalyst::TSVBase.boolean(entry[:chat_task].nil? ? nil : entry[:chat_task]),
+      ChatAnalyst::TSVBase.text(entry[:agent]),
+      ChatAnalyst::TSVBase.text(entry[:conversation]),
+      ChatAnalyst::TSVBase.multi(sources, encoder: :text)]]
+  end
+
+  input :file, :path, 'Chat file or job root', nil, required: true, jobname: true, nofile: true
+  desc 'Core LIVE report TSV (contract 2F): one row per live entry of ChatAnalyst.live (the fail-soft wrapper over Chat.live_report - no reimplementation). Key Entry = the job reference when non-empty else the escaped path; fields kind (inference|workload_context|agent_activity|dangling_job), path, state, status, chat_task, agent, conversation, source (multi, |-joined subset of sidecar|agent_view|society). KEPT SEPARATE from live_chats file discovery (never merged into provenance traversal).'
+  task :chat_live_report => :tsv do |file|
+    result = ChatAnalyst.live(file)
+    rows = result[:entries].collect { |entry| chat_live_report_row(entry) }
+    # Key uniqueness: the core report is folded/deduplicated by job id, but a
+    # defensive positional suffix keeps the key grammar intact if two entries
+    # ever arrive with the same reference AND path.
+    seen = {}
+    rows.each_with_index do |row, index|
+      if seen[row[0]]
+        rows[index] = [[row[0], seen[row[0]].to_s] * '#'] + row.drop(1)
+        seen[row[0]] += 1
+      else
+        seen[row[0]] = 1
+      end
+    end
+    ChatAnalyst::TSVBase.build_table(
+      key_field: 'Entry',
+      fields: %w[kind path state status chat_task agent conversation source],
+      rows: rows,
+      annotations: {
+        root_path: ChatAnalyst::Ids.escape_path(result[:root][:path]),
+        total: rows.length
+      }
+    )
   end
 
 
-  export_exec :chat_overview, :chat_timeline, :chat_messages, :chat_range,
-              :chat_tool_call, :chat_tool_calls, :chat_tokens, :chat_accounting,
-              :live_chats, :inbox_state, :post_inbox_advice
+  export_exec :chat_overview, :job_overview, :chat_references, :job_dependencies,
+              :job_dependencies_recursive, :chat_role_counts, :chat_messages,
+              :chat_message, :chat_range, :chat_inferences,
+              :chat_activity_clusters, :chat_activity_cluster,
+              :chat_tool_call, :chat_tool_calls, :chat_tool_call_jobs,
+              :chat_tokens, :chat_token_events, :chat_token_evidence,
+              :chat_attribution, :chat_accounting,
+              :live_chats, :chat_live_report, :inbox_state, :inbox_note,
+              :post_inbox_advice
 end
 
 require 'ChatAnalyst/api'
+# Phase 3 base layer (research/phase3-contract.md): the entity-ID grammar
+# and the TSV serializer conventions, including the process-global
+# TSV.annotation registration every task run and test must see.  Loaded
+# after the API module (Ids wraps its canonical behaviors) and before any
+# task file that builds tables.
+require 'ChatAnalyst/ids'
+require 'ChatAnalyst/tsv_base'
+# Phase 3 plan step 3: inference entities and activity clusters (spec; contract
+# 1h/2B/2C as amended C1-C3).  After api.rb: uses its timeline internals and
+# canonical helpers; Ids must be loaded because it is addressed inside.
+require 'ChatAnalyst/inferences'
 require 'ChatAnalyst/tasks/api_tasks'
 
 
