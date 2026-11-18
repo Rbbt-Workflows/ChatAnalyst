@@ -3,8 +3,8 @@
 Analyst-facing usage of the ChatAnalyst workflow: how to walk a session,
 which task answers which question, token-count vocabulary, and the
 operational addressing rules. The task surface itself is in
-[ChatAnalyst/README.md](../../README.md); internals, encoding contract and
-retirements are in [doc/developer/README.md](../developer/README.md).
+[ChatAnalyst/README.md](../../README.md); internals and encoding
+conventions are in [doc/developer/README.md](../developer/README.md).
 
 ## The retrieval ladder for analysts
 
@@ -29,10 +29,18 @@ memorize, no synthetic ids:
    (`first == last` for one message), or `chat_message` with a Message id
    directly.
 
-Worked chain (a failed tool call): `chat_overview` ->
-`chat_activity_clusters` -> `chat_inferences` (chat filter, page) ->
-`chat_tool_calls` (success=false) -> `chat_tool_call` (metadata row) ->
-`chat_range` on the output message id.
+Worked chain (locate a failed tool call and read its evidence):
+
+1. `chat_overview` with `file` = a chat path or job root; note a Chat row
+   and unescape it before reuse.
+2. `chat_activity_clusters` with the same `file`; pass a cluster id to
+   `chat_activity_cluster`, or page `chat_inferences` with the unescaped
+   Chat row as the `chat` filter.
+3. `chat_tool_calls` with `success=false` narrows the call list.
+4. `chat_tool_call` on that chat file with `call_index` = the call's
+   message index (the `#`-suffix of its ToolCall key).
+5. `chat_range` with `file` = the unescaped chat path of the row's
+   output_message_id and `first` = `last` = that id's `#`-suffix index.
 
 ## Addressing rules you need when reading tables
 
@@ -54,11 +62,11 @@ Worked chain (a failed tool call): `chat_overview` ->
   50) applies only when `page` is given; an out-of-range page yields empty
   rows, and `total` always counts the unpaginated universe.
 
-## Task tables (phase 3 grouping)
+## Task tables
 
-Grouping follows the phase-3 contract (`research/phase3-contract.md` §2).
+Grouped by what a caller is usually trying to do.
 
-**A. Overview and relationship tables**
+**Overview and relationship tables**
 
 | task | output / key | purpose |
 |---|---|---|
@@ -69,23 +77,23 @@ Grouping follows the phase-3 contract (`research/phase3-contract.md` §2).
 | `job_dependencies_recursive` | :tsv, Dependency = dependency#depth | Recursive closure (see developer doc). Inputs: `file`, `max_depth` (default 10). |
 | `chat_role_counts` | :tsv, ChatRole = chat#role | Message counts per chat and role; the only `:to_i`-cast table in group A. Input: `file`. |
 
-**B. Message and inference tables**
+**Message and inference tables**
 
 | task | output / key | purpose |
 |---|---|---|
 | `chat_messages` | :tsv, Message | Zero-based index of every message in one chat: role, characters, timestamp, large flag. Never bodies. Inputs: `file` (chat), `role` (filter), `page`, `per_page`. |
 | `chat_message` | :chat | Byte-exact persisted text of ONE message. Input: `message_id` (the Message id grammar; the chat and index are recovered by parsing it). Addressing in the persisted job inputs. |
-| `chat_range` | :tsv->:chat | Byte-exact persisted slice of one chat, `first`..`last` inclusive (`first == last` valid); cap 200 messages per request. Inputs: `file` (chat only; job roots rejected), `first`, `last`. The old `raw` input is retired: the byte-exact form is THE output. Addressing in the persisted job inputs. |
+| `chat_range` | :tsv->:chat | Byte-exact persisted slice of one chat, `first`..`last` inclusive (`first == last` valid); cap 200 messages per request. Inputs: `file` (chat only; job roots rejected), `first`, `last`. The output is the byte-exact persisted slice. Addressing in the persisted job inputs. |
 | `chat_inferences` | :tsv, Inference = meta Message id | Tree-wide chronological inference list: timestamp, reasoning_present, reasoning_characters, first/last/trigger/assistant Message ids, activity_cluster_id, tool_call_count. Inputs: `file`, `max_gap_seconds` (default 120), `page`, `per_page`, `chat` (filter). Paginated. |
 
-**C. Activity clusters**
+**Activity clusters**
 
 | task | output / key | purpose |
 |---|---|---|
-| `chat_activity_clusters` | :tsv, Cluster = first inference's Message id | COMPACT INDEX ONLY (no member lists): first/last timestamp, duration_seconds, inference_count, chats (multi-value), tool_call_count, delegation_count; annotations clusters/inferences/unclustered. Inputs: `file`, `max_gap_seconds`. |
+| `chat_activity_clusters` | :tsv, Cluster = first inference's Message id | Compact index (no member lists): first/last timestamp, duration_seconds, inference_count, chats (multi-value), tool_call_count, delegation_count; annotations clusters/inferences/unclustered. Inputs: `file`, `max_gap_seconds`. |
 | `chat_activity_cluster` | :tsv, Inference | Member detail of ONE cluster, one row per member inference in chronological order (field list identical to chat_inferences); validated through a task dependency on chat_activity_clusters. Inputs: `file`, `cluster_id`, `max_gap_seconds`. |
 
-**D. Tool-call tables**
+**Tool-call tables**
 
 | task | output / key | purpose |
 |---|---|---|
@@ -93,16 +101,16 @@ Grouping follows the phase-3 contract (`research/phase3-contract.md` §2).
 | `chat_tool_calls` | :tsv, ToolCall | Tree-wide call index: output_message_id, tool, call_id, status, reason, timestamps, argument/output characters, inference_id, delegated, target_agent/target_conversation, copy_of, source_kind. Inputs: `file`, `page`, `per_page`, `dedupe`, filters `tool`/`agent`/`conversation`/`chat`/`success`; applied filters ride the `filters` annotation. Paginated. |
 | `chat_tool_call_jobs` | :tsv, CallJob = call_message_id#escaped_job_path | One row per (call, referenced job) pair; the `job` cell is the alignment copy. Input: `file`. |
 
-**E. Token tables**
+**Token tables**
 
 | task | output / key | purpose |
 |---|---|---|
-| `chat_tokens` | :tsv, Scope (`:to_i` cast) | SUMMARY: four rows (deduplicated_total, chat_evidence, receipt_evidence, receipt_only) x pt/ct/tt/cct/cwt/rt; annotations conflicts/incomplete_evidence. Input: `file`. OVERLAP WARNING: chat_evidence and receipt_evidence overlap and must not be summed; only deduplicated_total and receipt_only compare additively. The retired `attribution` input moved to chat_attribution. |
+| `chat_tokens` | :tsv, Scope (`:to_i` cast) | SUMMARY: four rows (deduplicated_total, chat_evidence, receipt_evidence, receipt_only) x pt/ct/tt/cct/cwt/rt; annotations conflicts/incomplete_evidence. Input: `file`. OVERLAP WARNING: chat_evidence and receipt_evidence overlap and must not be summed; only deduplicated_total and receipt_only compare additively. The attribution view is `chat_attribution`. |
 | `chat_token_events` | :tsv, TokenEvent | Paginated deduplicated event list: token counts, deduplication enumeration (inference_id/provider_response_id/lineage/receipt), conflict/incomplete flags, canonical evidence source/origin. Inputs: `file`, `page`, `per_page`. |
 | `chat_token_evidence` | :tsv, Evidence = token_event_id#occurrence | Aligned evidence rows, canonical evidence first (occurrence 1): origin, source, call_id, tool_name, and the origin-specific addresses. Input: `file`. |
 | `chat_attribution` | :tsv, Bucket | Three rows (root, delegated, unattributed) of the canonical-evidence-source split, plus events count; conflicts/incomplete_evidence as quality annotations. Input: `file`. The linked/unresolved job lists stay on the overview/job surfaces. |
 
-**F. Operational tasks**
+**Operational tasks**
 
 | task | output / key | purpose |
 |---|---|---|
@@ -131,8 +139,11 @@ Typical programmatic use (the Ruby API layer — see the developer doc for
 the full method list):
 
     report = ChatAnalyst.tokens('/path/to/session.chat')
+    # => Hash; [:events] feeds chat_token_events, the totals feed chat_tokens
     view   = ChatAnalyst.attribution('/path/to/session.chat')
+    # => Hash with the root/delegated/unattributed token splits
 
 For command-line inspection of the same model, use:
 
     scout-ai llm prov /path/to/session.chat
+    # prints scout-ai's provenance token report for that chat

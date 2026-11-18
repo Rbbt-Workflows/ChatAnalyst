@@ -25,8 +25,8 @@ was read from.)
   of one chat file; `chat_range` spans are inclusive at both ends.
 - `characters` counts the characters of the **parsed message content** string;
   it is never a file byte offset. Cumulative offsets are deliberately not
-  exposed (documented Phase A decision: exactly one coordinate system —
-  parse position — that cannot drift from `Chat.load`).
+  exposed: exactly one coordinate system — parse position — exists, so it
+  cannot drift from `Chat.load`.
 - Paths in public results are canonical absolute paths, directly usable as
   later inputs — ONE canonical spelling across every public operation
   (`Chat.provenance_path` realpath with expand_path fallback), pinned against
@@ -34,8 +34,9 @@ was read from.)
   canonical path is **escaped** per the encoding conventions below; unescape
   before feeding a path back into a task `file` input.
 - `:chat` outputs (`chat_message`, `chat_range`) are the bare persisted chat
-  text with **no `#:` annotation line and no metadata sidecar** (probe-pinned,
-  `share/probes/b4_probe_chat_output.rb`): their addressing (chat path,
+  text with **no `#:` annotation line and no metadata sidecar** (pinned by
+  the regression tests `test/test_chat_range_raw.rb` and
+  `test/test_agent_meta_tasks.rb`): their addressing (chat path,
   first/last indices) lives in the **persisted job inputs** (`step.info`
   `inputs`/`provided_inputs`), never in the output text. Consumers cannot
   read annotations from a `:chat` output.
@@ -43,10 +44,10 @@ was read from.)
   result.
 - There is **no `follow` input anywhere**: traversal always follows job
   references and direct dependencies, and never follows delegation targets or
-  live sidecar chats (Stage 0 decision, `research/stage0-notes.md`).
+  live sidecar chats.
 - ChatAnalyst never calls the retired materialized-graph collectors
   (`provenance_closure` / `provenance_edges` / `provenance_chat_files` /
-  `provenance_jobs`); the old materialized reconstruction is gone.
+  `provenance_jobs`).
 
 ## Public Ruby API (`lib/ChatAnalyst/api.rb`, `lib/ChatAnalyst/inferences.rb`)
 
@@ -61,16 +62,14 @@ ChatAnalyst.tokens(root)
 ChatAnalyst.attribution(root)                 # root/delegated/unattributed split
 ChatAnalyst.relationships(chat_path)
 ChatAnalyst.live(root)
-ChatAnalyst.inferences(root, max_gap_seconds: 120)          # phase 3
-ChatAnalyst.activity_clusters(root, max_gap_seconds: 120)   # phase 3
+ChatAnalyst.inferences(root, max_gap_seconds: 120)
+ChatAnalyst.activity_clusters(root, max_gap_seconds: 120)
 ChatAnalyst.activity_cluster(root, cluster_id, max_gap_seconds: 120)
 ```
 
 `root` is a chat file path or a job root (a persisted Step directory,
 detected by its `.info` sidecar); `root_type: :chat | :job` overrides the
-detection. `ChatAnalyst.timeline` also still exists as a Ruby method (its
-TASK was retired in phase 3; the inference/cluster model above is the
-successor surface). Four further module methods are public but auxiliary,
+detection. Four further module methods are public but auxiliary,
 not part of the analytical surface above: `overview_job_frontier(root)`
 (the frontier of directly referenced jobs), `relationship_references(path)`
 (import:/continue:/last: reference events of one chat),
@@ -87,7 +86,7 @@ not part of the analytical surface above: `overview_job_frontier(root)`
   invocation context and is never read. Live sidecar paths are listed, never
   traversed. References are recursively normalized to plain canonical
   Strings. `unloaded_references` entries are `{kind, path, error, via}`.
-- **inferences / activity_clusters / activity_cluster** (phase 3) — the
+- **inferences / activity_clusters / activity_cluster** — the
   inference and activity-cluster model described below; one computation per
   (root, max_gap_seconds), shared by the three tasks through a Scout task
   dependency (`chat_activity_cluster` `dep`s `chat_activity_clusters`).
@@ -159,9 +158,9 @@ of the parent chat. Provenance traversal follows their `job=` references, and
 token accounting counts their direct events once, deduplicated by
 `inference_id` against any saved child log that carries the same event.
 
-## Encoding conventions (phase 3, frozen contract)
+## Encoding conventions
 
-Every TSV output follows `research/phase3-contract.md` §1; the essentials:
+Every TSV output follows these conventions; the essentials:
 
 - **Escaping** (applied to every path-valued key and cell, single pass):
 
@@ -249,7 +248,7 @@ Every TSV output follows `research/phase3-contract.md` §1; the essentials:
   (`step.info`), not in the output text and not in annotations — consumers
   cannot read annotations from a `:chat` output.
 
-## The inference / activity-cluster model (phase 3)
+## The inference / activity-cluster model
 
 - **One inference per meta message.** Scout-ai UNSHIFTS each inference meta
   BEFORE the response segment it accounts for, so the persisted shape is:
@@ -262,8 +261,7 @@ Every TSV output follows `research/phase3-contract.md` §1; the essentials:
   LAST inference meta BEFORE it in the same chat — its emitter. A call
   with no preceding meta (an opening unaccounted call, legacy chats) is
   unassociated (`inference_id` = `\N`); NO synthetic inference is ever
-  created. The pinned-semantics evidence lives in the bout-3 record
-  (`tmp/phase3-b3/bout3-record.md`, probes `b3_pin_*`).
+  created.
 - **Trigger** = the nearest preceding non-meta message (the user request or
   the tool output being reacted to), scanning past consecutive metas; nil
   when nothing precedes. **Assistant** = the meta's immediate successor
@@ -276,8 +274,7 @@ Every TSV output follows `research/phase3-contract.md` §1; the essentials:
   undated inference joins NO cluster, carries `\N` activity_cluster_id,
   never bridges distant clusters, and influences no gap computation —
   `unclustered` is a real, possibly-nonzero count of exactly these.
-  Clusters are temporal groupings only; they carry no semantic phase
-  claims.
+  Clusters are temporal groupings only; they make no semantic claims about
 
 ## Recursive dependencies
 
@@ -290,46 +287,18 @@ Every TSV output follows `research/phase3-contract.md` §1; the essentials:
   duplicates collapse to the first `via_owner`, cycle-safe by the visited
   set, stops at `max_depth` (default 10). Seed nodes never become rows.
 
-## Retired adapters (phase 2)
+## Retired task names
 
-The four Phase C legacy adapters — `message_index`, `message_content`,
-`extract_chat_range`, `chat_report` — were retired in the phase-2 minimal
-revision (plan step 5). Retired names raise `TaskNotFound`. Byte-for-byte
-snapshots of the deleted declarations plus SHA256SUMS live in
-`var/baselines/rev-phase2-removed/`. Their pinned coverage lives on in
-`chat_messages`, `chat_range`, `chat_tokens attribution: true` (now
-`chat_attribution`).
+Calling a retired name raises `TaskNotFound`. Byte-for-byte snapshots of the
+deleted declarations plus SHA256SUMS live in `var/baselines/`:
 
-## Phase-3 retirement and behavior changes
-
-Retirement snapshots for every converted task live in
-`var/baselines/phase3-removed/` (12 files + README + SHA256SUMS).
-
-- **chat_timeline — RETIRED** (the only vanishing name; raises
-  `TaskNotFound`, pinned by test). Replacements: `chat_activity_clusters` +
-  `chat_activity_cluster` (temporal grouping, two-mode selection) and
-  `chat_inferences` (the drill-down), all over
+- `message_index`, `message_content`, `extract_chat_range`, `chat_report` —
+  legacy adapters; their coverage lives on in `chat_messages`, `chat_range`
+  and `chat_attribution`.
+- `chat_timeline` — temporal grouping and drill-down live in
+  `chat_activity_clusters` + `chat_activity_cluster` (overview and member
+  detail) and `chat_inferences`, all over
   `ChatAnalyst.inferences`/`activity_clusters`.
-- **chat_tool_call is metadata-only** (pinned): the old JSON task returned
-  full arguments and output content; the TSV row carries sizes and
-  addresses ONLY — retrieve bodies through `chat_range` on the call/output
-  message ids.
-- **chat_range raw-input retirement** (pinned): the byte-exact persisted
-  slice is now THE output (the old `raw: true` behavior is inherent); the
-  `raw` input is retired and ignored.
-- **inbox_state is index-only** (pinned): note bodies are no longer
-  embedded; read them with `inbox_note`.
-- **chat_tokens attribution-input retirement** (pinned): the `attribution`
-  input is gone; the attribution view lives in `chat_attribution`.
-- **live_chats status-block drop** (pinned): the JSON job-root status block
-  is dropped; the root is addressable through `chat_overview`/`job_overview`.
-  Keys and jobs_file cells are escaped ABSOLUTE paths now (the old JSON used
-  `~/`-shortened keys).
-- **post_inbox_advice prose drop** (pinned): the static delivery-semantics
-  prose is dropped from the result; it lives in the task desc and here. The
-  delivery semantics: the note is consumed once as a user message on the
-  next real inference, never persisted in the transcript; the moved file in
-  `inbox_removed/` is the delivery record.
 
 ## scout-ai version guard (conditional)
 
@@ -343,35 +312,30 @@ or the provenance canary fails, check in this order:
    Installed 2.0.0 or older gems predate the API (the 2.0.0 gem lacks
    `provenance_graph`).
 2. **Resolve a newer source when the gem is old**: run with
-   `-I<scout-ai-checkout>/lib` so the checkout's `scout/` shadows the gem
-   (historical spelling: `-I/home/mvazque2/git/scout-ai/lib` — that path no
-   longer exists on this machine; use whatever checkout root you actually
-   have).
+   `-I<scout-ai-checkout>/lib` so the checkout's `scout/` shadows the gem.
 
 In THIS environment (2026-11-14) scout-ai 2.1.0 is the active gem and
 `Chat.respond_to?(:provenance_graph)` is true, so no `-I` override is
 needed. The test helper still asserts the canary
-(`test/test_chat_analyst_api.rb`: `assert Chat.respond_to?(:provenance_graph)`,
-message "the scout-ai 2.0.0 gem shadowed the checkout") so a future
+(`test/test_chat_analyst_api.rb`: `test_scout_ai_core_provides_the_compact_provenance_api`,
+message "Chat.provenance_graph missing: the scout-ai 2.0.0 gem shadowed the
+checkout") so a future
 regression to an old gem fails loudly instead of producing nil graphs.
 
 ## Limitations, honestly
 
-- **Uncommitted changes**: this checkout is a working submodule with local
-  commits (`git -C ChatAnalyst log` works; branch `main`), and it carries
-  uncommitted modifications (README and several `lib/`/`test/` files at
-  audit time). Git is functional; the old "git metadata is broken" claim
-  was stale and is withdrawn. Provenance for the phase work remains
-  snapshot-based (`var/baselines/` + SHA256SUMS + bout records under
-  `tmp/phase3-*/`).
+- **Git state**: this checkout is a working submodule (`.git` points at
+  `../.git/modules/ChatAnalyst`), but that parent module directory is
+  currently absent on this machine, so `git -C ChatAnalyst ...` fails with
+  "not a git repository". Treat the tree as plain files; provenance in this
+  checkout is snapshot-based (`var/baselines/` + SHA256SUMS + working run
+  records under `tmp/`), which does not depend on git.
 - **Scale receipts** (real tree, the 6.59 MB / 3128-message ScoutCoder
   chat, 1035 calls, 1034 timestamped inferences):
   `chat_tool_calls` page 1/50 = 2.24 s / 30,803 bytes; `chat_tool_call`
   detail = 1.559 s / 991 bytes; `chat_activity_clusters` = 3.4 s / 34 rows
   (13,214 bytes); `chat_inferences` page 1 (per_page 20) = 0.82 s; tokens
   family on the child chat: `chat_tokens` 6.5 s, `chat_attribution` 7.3 s.
-  Full receipts: `tmp/phase3-b5/realtree-run.txt`,
-  `tmp/phase3-b7/rehearsal/`.
 - **chat_evidence / receipt_evidence overlap**: the two scope rows are
   EVIDENCE COVERAGE descriptions and MUST NOT be summed; only
   `deduplicated_total` and `receipt_only` compare additively.

@@ -26,6 +26,9 @@ ChatAnalyst=/$PWD filter="*" {
   timeline.analyze
 
   new_implementation
+  new_implementation.analyze
+
+  documentation
 
  }
  lib=lib{
