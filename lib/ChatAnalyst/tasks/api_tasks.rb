@@ -553,7 +553,11 @@ module ChatAnalyst
   task :chat_tool_calls => :tsv do |file, page, per_page, dedupe, tool, agent, conversation, chat, success|
     overview, chat_paths = tree_wide_call_chats(file)
     calls = chat_paths.flat_map do |path|
-      ChatAnalyst.tool_calls(path)[:calls].collect { |call| call.merge(chat: path) }
+      begin
+        ChatAnalyst.tool_calls(path)[:calls].collect { |call| call.merge(chat: path) }
+      rescue JSON::ParserError => e
+        raise ScoutException, "Error parsing tool call JSON: " + e.message
+      end
     end
     calls, = dedupe ? mark_call_copies(calls) : [calls, nil]
 
