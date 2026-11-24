@@ -1301,7 +1301,11 @@ module ChatAnalyst
   def self.timeline_arguments_string(call)
     arguments = call[:arguments]
     return '' if arguments.nil?
-    arguments = Chat.parse_json(arguments) if String === arguments
+    arguments = begin
+                  Chat.parse_json(arguments) 
+                rescue
+                  {error: 'Error parsing JSON: ' + $!.message}
+                end if String === arguments
     return arguments.to_s unless Hash === arguments
     sorted = arguments.sort_by { |key, _| key.to_s }
     sorted.collect { |key, value| "#{key}=#{value.inspect}" }.join('&')
